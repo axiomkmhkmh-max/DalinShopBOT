@@ -10,10 +10,10 @@ from pymongo.errors import DuplicateKeyError
 from config import get_config
 from constants import OrderStatus as S
 from db import get_db
-import fulfillment, orders
+import fulfillment, notifier, orders, telegram_supply
 import settings as st
 import pricing_engine as engine
-from pricing_providers import ProviderError, build_price_provider, build_rate_provider
+from pricing_providers import build_rate_provider
 from util import as_aware, utcnow
 
 log = logging.getLogger(__name__)
@@ -34,8 +34,11 @@ async def acquire_lock(name: str, ttl_seconds: int) -> bool:
 
 
 async def run_pricing_cycle(force: bool = False) -> dict | None:
-    """Respects the admin-configured interval so the upstream API is not hit more than needed."""
+    """Scheduled refresh: (1) rate API  (2) Telegram gift/premium prices, availability, bot balance
+    (3) recompute every quote. Respects the on/off switch and the interval set in the dashboard."""
     db = get_db()
+    if not force and not await st.get_bool("auto_refresh_enabled"):
+        return None
     interval = timedelta(minutes=await st.get_int("refresh_interval_minutes"))
     state = await db.settings.find_one({"key": "_pricing_last_run"})
     last = as_aware(state["value"]) if state else None
@@ -43,23 +46,31 @@ async def run_pricing_cycle(force: bool = False) -> dict | None:
         return None
     if not await acquire_lock("pricing", 120):
         return None
-    cfg = get_config()
     try:
-        pp = build_price_provider(await st.get_setting("price_provider"), cfg)
-        rp = build_rate_provider(await st.get_setting("rate_provider"), cfg)
-    except ProviderError:
-        log.exception("pricing providers misconfigured")
-        return None
-    report = await engine.refresh_all(pp, rp, fetch=True)
-    await db.settings.update_one({"key": "_pricing_last_run"}, {"$set": {"value": utcnow()}}, upsert=True)
-    return report
+        supply = await telegram_supply.sync_supply(notifier.get_bot())
+        report = await engine.refresh_all(build_rate_provider(get_config()), fetch=True)
+        report["supply"] = supply
+        await db.settings.update_one({"key": "_pricing_last_run"}, {"$set": {"value": utcnow()}}, upsert=True)
+        return report
+    finally:
+        await db.locks.delete_one({"_id": "pricing"})      # the lock only protects a run in progress
 
 
 async def run_order_maintenance() -> None:
     await orders.expire_pending_orders()
+    db = get_db()
     cutoff = utcnow() - timedelta(minutes=2)
-    async for o in get_db().orders.find({"status": S.PAID, "paid_at": {"$lt": cutoff}}):
+    async for o in db.orders.find({"status": S.PAID, "paid_at": {"$lt": cutoff}}):
         await fulfillment.fulfill_order(o["public_id"])      # recovery: paid but never claimed
+    # Claimed for delivery but no outcome was ever recorded (crash / restart): flag once for the admin.
+    stuck = utcnow() - timedelta(minutes=10)
+    async for o in db.orders.find({"status": S.PROCESSING, "fulfillment_status": "PROCESSING", "updated_at": {"$lt": stuck}}):
+        res = await db.orders.update_one({"public_id": o["public_id"], "fulfillment_status": "PROCESSING"},
+                                         {"$set": {"fulfillment_status": "MANUAL_PENDING"}})
+        if res.modified_count == 1:
+            await notifier.send_admins(
+                f"سفارش {o['public_id']} در حال پردازش گیر کرده است (نتیجه تحویل ثبت نشد). "
+                "قبل از هر اقدام در تلگرام بررسی کنید گیرنده محصول را گرفته یا نه، سپس «تحویل شد» یا بازپرداخت بزنید.")
 
 
 async def loop(name: str, coro_factory, every: int) -> None:

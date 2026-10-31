@@ -2,22 +2,27 @@ from __future__ import annotations
 
 import re
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from config import get_config
 from constants import STATUS_FA, OrderStatus as S, has_permission
 from db import get_db
-from money import MoneyError
+from money import MoneyError, to_decimal, validate_profit
 from payment_manager import get_provider
 import background_hooks as hooks
-import catalog, fulfillment, orders, wallet
+import catalog, fulfillment, orders, telegram_supply, wallet
+import pricing_engine as engine
 import settings as st
 from audit import audit
+from catalog import AUTO_DELIVERIES, DELIVERY_FA
 from notifier import get_bot, send_user
-from util import new_id, utcnow
+from telegram_supply import PREMIUM_STARS
+from util import as_aware, new_id, redact, utcnow
 import auth
 
 router = APIRouter()
@@ -28,7 +33,7 @@ NAV = [  # (label, path, permission)
     ("نمای کلی", "/", None), ("محصولات", "/products", "products"), ("دسته‌بندی‌ها", "/categories", "products"),
     ("قیمت‌گذاری", "/pricing", "pricing_view"), ("سفارش‌ها", "/orders", "orders_view"),
     ("پرداخت‌ها", "/payments", "payments"), ("کیف پول‌ها", "/wallets", "wallets_adjust"),
-    ("کاربران", "/users", "users"), ("تأمین‌کنندگان", "/suppliers", "suppliers"),
+    ("کاربران", "/users", "users"), ("تأمین و تحویل", "/suppliers", "suppliers"),
     ("پشتیبانی", "/tickets", "support"), ("لاگ ممیزی", "/audit", "audit"),
 ]
 
@@ -112,75 +117,273 @@ async def overview(request: Request, admin=Depends(auth.current_admin)):
     wallet_total = 0
     async for d in db.wallets.aggregate([{"$group": {"_id": None, "t": {"$sum": "$balance"}}}]):
         wallet_total = d["t"]
+    sup = await telegram_supply.get_supply_status()
+    manual_pending = await db.orders.count_documents({"status": S.PROCESSING, "fulfillment_status": "MANUAL_PENDING"})
     stats = [
         ("درآمد کل (تومان)", f"{revenue_total:,}", "cyan"),
         ("کل سفارش‌ها", await db.orders.count_documents({}), "blue"),
+        ("نیازمند تحویل دستی", manual_pending, "orange"),
         ("در انتظار پرداخت", status_counts[S.PENDING_PAYMENT], "orange"),
         ("ناموفق", status_counts[S.FAILED], "red"),
+        ("موجودی Stars ربات", sup.get("bot_balance") if sup.get("bot_balance") is not None else "—", "cyan"),
         ("کاربران", await db.users.count_documents({}), "green"),
         ("موجودی کیف پول‌ها", f"{wallet_total:,}", "blue"),
     ]
     recent = [p async for p in db.payments.find({}).sort("created_at", -1).limit(8)]
-    sup_status = [(s["name"], "فعال" if s.get("enabled") else "غیرفعال") async for s in db.suppliers.find({})]
+    sup_status = [("اتصال به تلگرام", "موفق" if sup.get("ok") else f"خطا: {sup.get('error') or 'هنوز همگام نشده'}"),
+                  ("آخرین همگام‌سازی", str(sup.get("checked_at") or "—")[:16])]
     return render(request, admin, "overview.html", stats=stats, daily=daily, status_counts=status_counts,
                   recent=recent, sup_status=sup_status, STATUS_FA=STATUS_FA)
 
 
 # ---------------- products / categories ----------------
+KIND_TITLES = {"stars": "Telegram Stars", "premium": "Telegram Premium", "gift": "Telegram Gifts", "other": "سایر"}
+CURRENCIES = [("IRT", "تومان"), ("IRR", "ریال"), ("USD", "دلار (USD)"), ("XTR", "Stars (قیمت خرید هر Star از تنظیمات)")]
+
+
+def _int_str(value) -> str:
+    """'200000.00' -> '200,000' (display only)."""
+    try:
+        return f"{int(Decimal(str(value)).to_integral_value()):,}"
+    except Exception:
+        return "—"
+
+
+def _product_row(p: dict, q: dict | None) -> list:
+    sup = p.get("supply") or {}
+    kind = p.get("kind")
+    if kind == "stars":
+        amount = f"{p.get('amount') or '—'} Stars"
+    elif kind == "premium":
+        amount = f"{p.get('amount') or '—'} ماه"
+    elif kind == "gift":
+        amount = f"{sup['stars_cost']} Stars" if sup.get("stars_cost") else "—"
+    else:
+        amount = "—"
+    stock = "نامحدود" if p.get("stock") is None else str(p["stock"])
+    if sup.get("remaining") is not None:
+        stock += f" (تلگرام: {sup['remaining']})"
+    status = "فعال" if p.get("enabled") else "غیرفعال"
+    err = (q or {}).get("error") or sup.get("error")
+    if err:
+        status += f" ⚠ {err}"
+    pid = p["public_id"]
+    buttons = [
+        {"link": {"href": f"/products/{pid}", "label": "ویرایش"}},
+        {"form": {"action": f"/products/{pid}/toggle", "label": "غیرفعال کن" if p.get("enabled") else "فعال کن",
+                  "confirm": ""}},
+    ]
+    return [p["name"], amount, DELIVERY_FA.get(p.get("delivery") or "manual", "دستی"),
+            _int_str(q["cost_toman"]) if q and q.get("cost_toman") else "—",
+            _int_str(q["final_toman"]) if q and q.get("final_toman") else "—",
+            (q or {}).get("stars_amount") or "—", stock, status,
+            str((q or {}).get("updated_at") or "")[:16] or "—", buttons]
+
+
+def _product_form(action: str, title: str, cats, v: dict | None = None) -> dict:
+    v = v or {}
+    pricing = v.get("pricing") or {}
+    sup = v.get("supply") or {}
+    return {"action": action, "title": title, "submit": "ذخیره", "fields": [
+        form_field("name", "نام محصول", v.get("name", ""), required=True),
+        form_field("description", "توضیحات", v.get("description", "")),
+        form_field("category_id", "دسته‌بندی", v.get("category_id") or "", "select", [("", "—")] + cats),
+        form_field("kind", "نوع", v.get("kind", "stars"), "select",
+                   [("stars", "Stars"), ("premium", "Premium"), ("gift", "Gift"), ("other", "سایر")]),
+        form_field("amount", "مقدار (Stars: تعداد Star · Premium: ۳ یا ۶ یا ۱۲ ماه · Gift: خالی)",
+                   "" if v.get("amount") is None else str(v["amount"])),
+        form_field("gift_id", "شناسه گیفت (فقط Gift؛ بهتر است از دکمه «دریافت گیفت‌ها» استفاده کنید)", v.get("gift_id") or ""),
+        form_field("delivery_mode", "روش تحویل (Stars همیشه دستی است)",
+                   "manual" if v and (v.get("delivery") or "manual") == "manual" else "auto", "select",
+                   [("auto", "خودکار توسط ربات (Premium / Gift)"), ("manual", "دستی (شما تحویل می‌دهید)")]),
+        form_field("price_source", "منبع قیمت خرید", pricing.get("source") or "manual", "select",
+                   [("telegram", "خودکار از تلگرام (Premium / Gift)"), ("manual", "دستی")]),
+        form_field("manual_amount", "قیمت خرید دستی (خالی در Stars = تعداد Star × قیمت خرید هر Star)",
+                   str(pricing.get("manual_amount") or "")),
+        form_field("manual_currency", "ارز قیمت خرید دستی", pricing.get("manual_currency") or "IRT", "select", CURRENCIES),
+        form_field("profit_toman", "سود اختصاصی (۰ تا ۷۰۰۰ تومان؛ خالی = سود پیش‌فرض)", str(v.get("profit_toman") or "")),
+        form_field("stock", "موجودی (خالی = نامحدود)", "" if v.get("stock") is None else str(v["stock"])),
+        form_field("enabled", "وضعیت", "1" if v.get("enabled", False) else "0", "select",
+                   [("1", "فعال"), ("0", "غیرفعال")]),
+    ]}
+
+
+def _parse_product(f: dict) -> dict:
+    """Form values -> product document. Raises ValueError with a Persian message for the admin."""
+    kind = f["kind"]
+    price_source = f["price_source"]
+    if price_source == "manual" and not f["manual_amount"].strip() and kind in ("premium", "gift"):
+        price_source = "telegram"      # no manual price typed: Premium/Gift use Telegram's own price
+    if kind not in KIND_TITLES:
+        raise ValueError("نوع محصول نامعتبر است")
+    amount = None
+    if f["amount"].strip():
+        if not f["amount"].strip().isdigit() or int(f["amount"]) < 1:
+            raise ValueError("مقدار باید یک عدد صحیح مثبت باشد")
+        amount = int(f["amount"])
+    gift_id = f["gift_id"].strip() or None
+    auto = f["delivery_mode"] == "auto"
+    pricing: dict
+    manual_amount = f["manual_amount"].strip()
+    if kind == "stars":
+        if not amount:
+            raise ValueError("برای Stars تعداد Star را وارد کنید")
+        delivery, gift_id = "manual", None          # no Bot API can send plain Stars: always manual
+        if price_source == "telegram":
+            raise ValueError("قیمت Stars از تلگرام خوانده نمی‌شود؛ منبع قیمت را «دستی» بگذارید")
+    elif kind == "premium":
+        if amount not in PREMIUM_STARS:
+            raise ValueError("برای Premium مقدار باید ۳، ۶ یا ۱۲ (ماه) باشد")
+        delivery, gift_id = ("auto_premium" if auto else "manual"), None
+    elif kind == "gift":
+        if not gift_id:
+            raise ValueError("شناسه گیفت لازم است")
+        delivery = "auto_gift" if auto else "manual"
+    else:
+        delivery, gift_id = "manual", None
+        if price_source == "telegram":
+            raise ValueError("برای این نوع فقط قیمت دستی ممکن است")
+    if price_source == "telegram":
+        pricing = {"source": "telegram"}
+    else:
+        if not manual_amount:
+            if kind != "stars":
+                raise ValueError("قیمت خرید دستی را وارد کنید")
+            pricing = {"source": "manual", "manual_amount": str(amount), "manual_currency": "XTR"}
+        else:
+            if to_decimal(manual_amount) <= 0:
+                raise ValueError("قیمت خرید باید مثبت باشد")
+            if f["manual_currency"] not in dict(CURRENCIES):
+                raise ValueError("ارز نامعتبر است")
+            pricing = {"source": "manual", "manual_amount": str(to_decimal(manual_amount)),
+                       "manual_currency": f["manual_currency"]}
+    profit = f["profit_toman"].strip()
+    if profit:
+        profit = str(validate_profit(profit))
+    stock = f["stock"].strip()
+    if stock:
+        if not stock.isdigit():
+            raise ValueError("موجودی باید عدد صحیح (۰ یا بیشتر) یا خالی باشد")
+        stock_val = int(stock)
+    else:
+        stock_val = None
+    return {"name": f["name"].strip(), "description": f["description"].strip(), "category_id": f["category_id"] or None,
+            "kind": kind, "amount": amount, "gift_id": gift_id, "delivery": delivery, "pricing": pricing,
+            "supplier_key": "telegram" if delivery in AUTO_DELIVERIES else "manual", "profit_toman": profit or None,
+            "stock": stock_val, "enabled": f["enabled"] == "1", "digital_in_telegram": True}
+
+
+PRODUCT_FIELDS = ("name", "description", "category_id", "kind", "amount", "gift_id", "delivery_mode", "price_source",
+                  "manual_amount", "manual_currency", "profit_toman", "stock", "enabled")
+
+
+async def _read_product_form(request: Request) -> dict:
+    form = await request.form()
+    return {k: str(form.get(k) or "") for k in PRODUCT_FIELDS}
+
+
 @router.get("/products", response_class=HTMLResponse)
 async def products_page(request: Request, admin=Depends(auth.current_admin)):
     need_any(admin, "products")
     db = get_db()
     cats = [(c["public_id"], c["name"]) async for c in db.categories.find({})]
-    rows = []
+    groups: dict[str, list] = {k: [] for k in KIND_TITLES}
     async for p in db.products.find({}).sort("created_at", -1):
         q = await db.price_quotes.find_one({"product_id": p["public_id"]})
-        price = f"{q['final_toman']:,}" if q and q.get("final_toman") else "—"
-        rows.append([p["name"], p.get("kind", ""), "فعال" if p.get("enabled") else "غیرفعال", price,
-                     p.get("supplier_key") or "manual", p["public_id"][:8]])
-    form = {"action": "/products/save", "title": "افزودن محصول", "submit": "ذخیره", "fields": [
-        form_field("name", "نام", required=True), form_field("description", "توضیحات"),
-        form_field("category_id", "دسته‌بندی", type_="select", options=cats),
-        form_field("kind", "نوع", type_="select", options=[("premium", "Premium"), ("stars", "Stars"), ("gift", "Gift"), ("other", "سایر")]),
-        form_field("source", "منبع قیمت پایه", type_="select", options=[("manual", "دستی"), ("provider", "Price Provider")]),
-        form_field("manual_amount", "قیمت پایه دستی (برای منبع دستی)"),
-        form_field("manual_currency", "ارز قیمت پایه", type_="select", options=[("IRT", "تومان"), ("IRR", "ریال"), ("USD", "USD"), ("TON", "TON")]),
-        form_field("provider_ref", "شناسه محصول نزد Provider (برای منبع Provider)"),
-        form_field("profit_toman", "سود اختصاصی (۰ تا ۷۰۰۰، خالی = پیش‌فرض)"),
-        form_field("supplier_key", "کلید تأمین‌کننده", value="manual"),
-        form_field("enabled", "فعال", type_="select", options=[("1", "بله"), ("0", "خیر")]),
-    ]}
-    return render(request, admin, "page.html", title="محصولات", forms=[form] if can(admin, "products") else [],
-                  tables=[{"title": "لیست محصولات", "columns": ["نام", "نوع", "وضعیت", "قیمت نهایی", "تأمین‌کننده", "شناسه"], "rows": rows}])
+        groups.setdefault(p.get("kind") if p.get("kind") in KIND_TITLES else "other", []).append(_product_row(p, q))
+    cols = ["نام", "مقدار", "تحویل", "قیمت خرید (تومان)", "قیمت فروش (تومان)", "Stars مشتری", "موجودی", "وضعیت",
+            "آخرین به‌روزرسانی قیمت", "عملیات"]
+    tables = [{"title": f"{KIND_TITLES[k]} ({len(rows)})", "columns": cols, "rows": rows} for k, rows in groups.items()
+              if rows or k != "other"]
+    actions = [{"action": "/products/import-gifts", "label": "دریافت گیفت‌ها از تلگرام"},
+               {"action": "/products/create-premium", "label": "ساخت پکیج‌های Premium (۳/۶/۱۲ ماه)"}]
+    return render(request, admin, "page.html", title="محصولات", actions=actions,
+                  forms=[_product_form("/products/new", "افزودن محصول", cats)], tables=tables)
 
 
-@router.post("/products/save")
-async def products_save(request: Request, admin=Depends(auth.current_admin), csrf: str = Form(""),
-                        name: str = Form(...), description: str = Form(""), category_id: str = Form(""),
-                        kind: str = Form("other"), source: str = Form("manual"), manual_amount: str = Form(""),
-                        manual_currency: str = Form("IRT"), provider_ref: str = Form(""),
-                        profit_toman: str = Form(""), supplier_key: str = Form("manual"), enabled: str = Form("1")):
+@router.get("/products/{pid}", response_class=HTMLResponse)
+async def product_edit_page(pid: str, request: Request, admin=Depends(auth.current_admin)):
+    need_any(admin, "products")
+    db = get_db()
+    p = await db.products.find_one({"public_id": pid})
+    if not p:
+        return back(request, "/products", "محصول پیدا نشد.")
+    cats = [(c["public_id"], c["name"]) async for c in db.categories.find({})]
+    q = await db.price_quotes.find_one({"product_id": pid}) or {}
+    sup = p.get("supply") or {}
+    info = [["قیمت خرید (تومان)", _int_str(q["cost_toman"]) if q.get("cost_toman") else "—"],
+            ["قیمت فروش (تومان)", _int_str(q["final_toman"]) if q.get("final_toman") else "—"],
+            ["سود (تومان)", _int_str(q["effective_profit_toman"]) if q.get("effective_profit_toman") else "—"],
+            ["Stars برای مشتری", q.get("stars_amount") or "—"],
+            ["آخرین به‌روزرسانی قیمت", str(q.get("updated_at") or "—")[:19]],
+            ["خطای قیمت", q.get("error") or "—"],
+            ["قیمت از تلگرام (Stars)", sup.get("stars_cost") or "—"],
+            ["آخرین همگام‌سازی با تلگرام", str(sup.get("checked_at") or "—")[:19]],
+            ["خطای تلگرام", sup.get("error") or "—"]]
+    return render(request, admin, "page.html", title=f"ویرایش: {p['name']}",
+                  forms=[_product_form(f"/products/{pid}/save", "ویرایش محصول", cats, p)],
+                  tables=[{"title": "وضعیت قیمت و تأمین", "columns": ["مورد", "مقدار"], "rows": info}])
+
+
+async def _save_product_from_request(request: Request, admin: dict, csrf: str, pid: str | None):
     auth.check_csrf(request, csrf)
     need_any(admin, "products")
     try:
-        if profit_toman.strip():
-            from money import validate_profit
-            profit_toman = str(validate_profit(profit_toman))
-        pricing = {"source": source, "provider_ref": provider_ref.strip() or None}
-        if source == "manual":
-            from money import to_decimal
-            if to_decimal(manual_amount) <= 0:
-                raise MoneyError("قیمت پایه باید مثبت باشد")
-            pricing.update({"manual_amount": str(to_decimal(manual_amount)), "manual_currency": manual_currency})
-    except MoneyError as exc:
-        return back(request, "/products", f"خطا: {exc}")
-    pid = await catalog.save_product({
-        "name": name.strip(), "description": description.strip(), "category_id": category_id or None, "kind": kind,
-        "pricing": pricing, "profit_toman": profit_toman.strip() or None,
-        "supplier_key": supplier_key.strip() or "manual", "enabled": enabled == "1", "digital_in_telegram": True})
-    await audit(admin["username"], "product_save", pid)
+        data = _parse_product(await _read_product_form(request))
+    except (ValueError, MoneyError) as exc:
+        return back(request, f"/products/{pid}" if pid else "/products", f"خطا: {exc}")
+    pid = await catalog.save_product(data, pid)
+    await audit(admin["username"], "product_save", pid, {"name": data["name"], "enabled": data["enabled"]})
     await hooks.recompute_all()
     return back(request, "/products", "محصول ذخیره شد.")
+
+
+@router.post("/products/new")
+async def product_create(request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    return await _save_product_from_request(request, admin, csrf, None)
+
+
+@router.post("/products/import-gifts")
+async def products_import_gifts(request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "products")
+    bot = get_bot()
+    if bot is None:
+        return back(request, "/products", "ربات فعال نیست (BOT_TOKEN).")
+    try:
+        n = await telegram_supply.import_gifts(bot)
+    except Exception as exc:
+        return back(request, "/products", f"خطا در دریافت گیفت‌ها: {redact(f'{type(exc).__name__}: {exc}')}")
+    await audit(admin["username"], "import_gifts", "", {"created": n})
+    return back(request, "/products", f"{n} گیفت جدید اضافه شد (غیرفعال است؛ هر کدام را که می‌خواهید بفروشید فعال کنید).")
+
+
+@router.post("/products/create-premium")
+async def products_create_premium(request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "products")
+    n = await telegram_supply.create_premium_products()
+    if get_bot() is not None:
+        await telegram_supply.sync_supply(get_bot())
+    await hooks.recompute_all()
+    await audit(admin["username"], "create_premium", "", {"created": n})
+    return back(request, "/products", f"{n} پکیج Premium اضافه شد (غیرفعال است؛ فعالش کنید).")
+
+
+@router.post("/products/{pid}/save")
+async def product_update(pid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    return await _save_product_from_request(request, admin, csrf, pid)
+
+
+@router.post("/products/{pid}/toggle")
+async def product_toggle(pid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "products")
+    p = await get_db().products.find_one({"public_id": pid})
+    if p:
+        await get_db().products.update_one({"public_id": pid}, {"$set": {"enabled": not p.get("enabled")}})
+        await audit(admin["username"], "product_toggle", pid, {"enabled": not p.get("enabled")})
+    return back(request, "/products", "وضعیت محصول تغییر کرد.")
 
 
 @router.get("/categories", response_class=HTMLResponse)
@@ -203,6 +406,14 @@ async def categories_save(request: Request, admin=Depends(auth.current_admin), c
 
 
 # ---------------- pricing ----------------
+def _age(ts) -> str:
+    ts = as_aware(ts)
+    if ts is None:
+        return "—"
+    mins = int((utcnow() - ts).total_seconds() // 60)
+    return f"{mins} دقیقه پیش" if mins < 120 else f"{mins // 60} ساعت پیش"
+
+
 @router.get("/pricing", response_class=HTMLResponse)
 async def pricing_page(request: Request, admin=Depends(auth.current_admin)):
     need_any(admin, "pricing", "pricing_view")
@@ -212,28 +423,56 @@ async def pricing_page(request: Request, admin=Depends(auth.current_admin)):
     async for q in db.price_quotes.find({}):
         p = await db.products.find_one({"public_id": q["product_id"]})
         rows.append([(p or {}).get("name", q["product_id"][:8]), q.get("base_amount") or "—", q.get("base_currency") or "",
-                     q.get("rate_toman_per_unit") or "—", q.get("profit_toman") or "—",
-                     f"{q['final_toman']:,}" if q.get("final_toman") else "—",
-                     q.get("stars_amount") or "—", q.get("seller_receivable_toman") or "—",
-                     str(q.get("updated_at") or ""), q.get("error") or "OK"])
-    rates = [[r["_id"], r.get("toman_per_unit") or "—", str(r.get("fetched_at") or ""), r.get("last_error") or "OK"]
-             async for r in db.exchange_rates.find({})]
+                     q.get("rate_toman_per_unit") or "—", _int_str(q["cost_toman"]) if q.get("cost_toman") else "—",
+                     q.get("profit_toman") or "—", _int_str(q["final_toman"]) if q.get("final_toman") else "—",
+                     q.get("stars_amount") or "—", q.get("stars_profit_toman") or "—",
+                     str(q.get("updated_at") or "")[:16], q.get("error") or "OK"])
+    rates = [[r["_id"], r.get("toman_per_unit") or "—", r.get("source") or "—", _age(r.get("fetched_at")),
+              r.get("last_error") or "OK"] async for r in db.exchange_rates.find({})]
+    sup = await telegram_supply.get_supply_status()
+    status_rows = [
+        ["به‌روزرسانی خودکار", "روشن" if s["auto_refresh_enabled"] == "true" else "خاموش"],
+        ["تحویل خودکار Premium/Gift", "روشن" if s["auto_delivery_enabled"] == "true" else "خاموش (سفارش‌ها دستی می‌مانند)"],
+        ["همگام‌سازی با تلگرام", f"{_age(sup.get('checked_at'))} — " + ("موفق" if sup.get("ok") else f"خطا: {sup.get('error') or 'هنوز انجام نشده'}")],
+        ["موجودی Stars ربات", sup.get("bot_balance") if sup.get("bot_balance") is not None else (sup.get("balance_error") or "—")],
+        ["منبع خودکار نرخ دلار", "تنظیم شده" if get_config().rate_api_url else "تنظیم نشده (نرخ را دستی وارد کنید)"],
+    ]
     editable = can(admin, "pricing")
-    fields = [form_field("profit_toman", "سود (۰ تا ۷٬۰۰۰ تومان)", s["profit_toman"]),
+    fields = [form_field("profit_toman", "سود پیش‌فرض (۰ تا ۷٬۰۰۰ تومان)", s["profit_toman"]),
               form_field("rounding_step", "گام گرد کردن (تومان)", s["rounding_step"]),
               form_field("rounding_mode", "نوع گرد کردن", s["rounding_mode"], "select", [("up", "به بالا"), ("down", "به پایین"), ("nearest", "نزدیک‌ترین")]),
+              form_field("stars_usd_value", "ارزش هر Star برای مشتری (دلار، مثلاً 0.02)", s["stars_usd_value"] or ""),
+              form_field("stars_cost_usd", "قیمت خرید هر Star برای شما (دلار)", s["stars_cost_usd"] or ""),
+              form_field("stars_payout_usd_value", "دریافتی شما از هر Star (دلار، اختیاری)", s["stars_payout_usd_value"] or ""),
+              form_field("auto_refresh_enabled", "به‌روزرسانی خودکار قیمت/موجودی", s["auto_refresh_enabled"], "select", [("true", "روشن"), ("false", "خاموش")]),
               form_field("refresh_interval_minutes", "بازه به‌روزرسانی (دقیقه، حداقل ۵)", s["refresh_interval_minutes"]),
-              form_field("max_age_minutes", "حداکثر عمر نرخ/قیمت (دقیقه)", s["max_age_minutes"]),
-              form_field("order_ttl_minutes", "مهلت پرداخت سفارش (دقیقه)", s["order_ttl_minutes"]),
-              form_field("stars_usd_value", "ارزش هر Star برای مشتری (USD)", s["stars_usd_value"] or ""),
-              form_field("stars_payout_usd_value", "دریافتی شما از هر Star (USD، اختیاری)", s["stars_payout_usd_value"] or ""),
-              form_field("price_provider", "Price Provider", s["price_provider"], "select", [("http_json", "http_json"), ("mock", "mock (فقط توسعه)")]),
-              form_field("rate_provider", "Rate Provider", s["rate_provider"], "select", [("http_json", "http_json"), ("mock", "mock (فقط توسعه)")])]
-    forms = [{"action": "/pricing/settings", "title": "تنظیمات قیمت‌گذاری", "submit": "ذخیره", "fields": fields}] if editable else []
+              form_field("max_age_minutes", "حداکثر عمر نرخ/داده خودکار (دقیقه) — بعدش فروش متوقف می‌شود", s["max_age_minutes"]),
+              form_field("manual_rate_max_age_minutes", "حداکثر عمر نرخ دستی (دقیقه) — بعدش فروش متوقف می‌شود", s["manual_rate_max_age_minutes"]),
+              form_field("auto_delivery_enabled", "تحویل خودکار Premium/Gift", s["auto_delivery_enabled"], "select", [("true", "روشن"), ("false", "خاموش")]),
+              form_field("order_ttl_minutes", "مهلت پرداخت سفارش (دقیقه)", s["order_ttl_minutes"])]
+    forms = []
+    if editable:
+        forms = [{"action": "/pricing/manual-rate", "title": "ثبت نرخ دلار به‌صورت دستی (تومان برای هر ۱ دلار)", "submit": "ثبت نرخ",
+                  "fields": [form_field("rate", "نرخ دلار (تومان)", required=True)]},
+                 {"action": "/pricing/settings", "title": "تنظیمات قیمت‌گذاری", "submit": "ذخیره", "fields": fields}]
     actions = [{"action": "/pricing/refresh", "label": "به‌روزرسانی همین حالا"}] if editable else []
-    return render(request, admin, "page.html", title="قیمت‌گذاری خودکار", forms=forms, actions=actions, tables=[
-        {"title": "نرخ‌های ارز (Toman per 1 unit)", "columns": ["ارز", "نرخ (تومان)", "زمان دریافت", "وضعیت"], "rows": rates},
-        {"title": "قیمت‌های محاسبه‌شده", "columns": ["محصول", "قیمت پایه", "ارز", "نرخ", "سود", "قیمت نهایی", "Stars", "دریافتی شما (تومان)", "آخرین به‌روزرسانی", "وضعیت"], "rows": rows}])
+    return render(request, admin, "page.html", title="قیمت‌گذاری", forms=forms, actions=actions, tables=[
+        {"title": "وضعیت منابع", "columns": ["مورد", "وضعیت"], "rows": status_rows},
+        {"title": "نرخ‌های ارز (تومان برای هر ۱ واحد)", "columns": ["ارز", "نرخ (تومان)", "منبع", "زمان دریافت", "وضعیت"], "rows": rates},
+        {"title": "قیمت‌های محاسبه‌شده", "columns": ["محصول", "قیمت پایه", "ارز", "نرخ", "قیمت خرید (تومان)", "سود تنظیمی", "قیمت فروش (تومان)", "Stars", "سود واقعی با Stars (تومان)", "آخرین به‌روزرسانی", "وضعیت"], "rows": rows}])
+
+
+@router.post("/pricing/manual-rate")
+async def pricing_manual_rate(request: Request, admin=Depends(auth.current_admin), csrf: str = Form(""), rate: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "pricing")
+    try:
+        await engine.set_manual_rate("USD", rate.strip().replace(",", "").replace("٬", ""))
+    except MoneyError as exc:
+        return back(request, "/pricing", f"خطا: {exc}")
+    await audit(admin["username"], "manual_usd_rate", "USD", {"rate": rate.strip()})
+    await hooks.recompute_all()
+    return back(request, "/pricing", "نرخ دلار ثبت شد و قیمت‌ها دوباره محاسبه شدند.")
 
 
 @router.post("/pricing/settings")
@@ -244,9 +483,10 @@ async def pricing_settings(request: Request, admin=Depends(auth.current_admin), 
     changed = []
     try:
         for key in ("profit_toman", "rounding_step", "rounding_mode", "refresh_interval_minutes", "max_age_minutes",
-                    "order_ttl_minutes", "stars_usd_value", "stars_payout_usd_value", "price_provider", "rate_provider"):
+                    "manual_rate_max_age_minutes", "order_ttl_minutes", "stars_usd_value", "stars_cost_usd",
+                    "stars_payout_usd_value", "auto_refresh_enabled", "auto_delivery_enabled"):
             val = (form.get(key) or "").strip()
-            if val == "" and key in ("stars_usd_value", "stars_payout_usd_value"):
+            if val == "" and key in ("stars_usd_value", "stars_cost_usd", "stars_payout_usd_value"):
                 continue
             if val and val != (await st.get_setting(key) or ""):
                 await st.set_setting(key, val)
@@ -264,35 +504,49 @@ async def pricing_refresh(request: Request, admin=Depends(auth.current_admin), c
     need_any(admin, "pricing")
     report = await hooks.refresh_now()
     await audit(admin["username"], "pricing_refresh")
-    return back(request, "/pricing", "درخواست به‌روزرسانی اجرا شد." if report else "به‌روزرسانی انجام نشد (قفل یا تنظیمات Provider).")
+    return back(request, "/pricing", "به‌روزرسانی اجرا شد (نتیجه را در جدول‌ها ببینید)." if report else "به‌روزرسانی انجام نشد (قفل فعال است).")
 
 
 # ---------------- orders ----------------
+MANUAL_FILTER = "MANUAL"
+
+
 @router.get("/orders", response_class=HTMLResponse)
 async def orders_page(request: Request, status: str = "", q: str = "", page: int = 1, admin=Depends(auth.current_admin)):
     need_any(admin, "orders_view", "orders")
     flt: dict = {}
-    if status in STATUS_FA:
+    if status == MANUAL_FILTER:
+        flt = {"status": S.PROCESSING, "fulfillment_status": "MANUAL_PENDING"}
+    elif status in STATUS_FA:
         flt["status"] = status
     if q:
         flt["$or"] = [{"public_id": {"$regex": "^" + re.escape(q[:32])}}, {"user_id": int(q)} if q.isdigit() else {"public_id": "x"}]
     per = 25
-    total = await get_db().orders.count_documents(flt)
+    db = get_db()
+    total = await db.orders.count_documents(flt)
+    items = [o async for o in db.orders.find(flt).sort("created_at", -1).skip((max(page, 1) - 1) * per).limit(per)]
+    names = {u["telegram_id"]: u.get("username") async for u in db.users.find({"telegram_id": {"$in": [o["user_id"] for o in items]}})}
     rows = []
-    async for o in get_db().orders.find(flt).sort("created_at", -1).skip((max(page, 1) - 1) * per).limit(per):
+    for o in items:
         btns = []
         if can(admin, "orders"):
             if o["status"] == S.FAILED:
                 btns.append({"form": {"action": f"/orders/{o['public_id']}/retry", "label": "تلاش مجدد تحویل", "confirm": "تحویل دوباره انجام شود؟"}})
             if o["status"] == S.PROCESSING:
-                btns.append({"form": {"action": f"/orders/{o['public_id']}/deliver", "label": "تحویل شد", "confirm": "تحویل دستی ثبت شود؟", "text_field": "delivery_text"}})
+                btns.append({"form": {"action": f"/orders/{o['public_id']}/deliver", "label": "تحویل شد", "confirm": "تحویل ثبت شود؟ (مطمئن شوید محصول را تحویل داده‌اید)", "text_field": "delivery_text"}})
         if can(admin, "refunds") and o["status"] in (S.PAID, S.PROCESSING, S.FAILED, S.FULFILLED):
-            btns.append({"form": {"action": f"/orders/{o['public_id']}/refund", "label": "بازپرداخت Stars", "confirm": "بازپرداخت انجام و غیرقابل بازگشت است. ادامه؟", "danger": True}})
-        rows.append([o["public_id"][:8], o["user_id"], o["product_name"], f"{o['total_toman']:,}", o.get("stars_amount") or "—",
-                     STATUS_FA.get(o["status"], o["status"]), o.get("fulfillment_error") or "", str(o["created_at"])[:16], btns])
-    return render(request, admin, "page.html", title="سفارش‌ها", forms=[], filters={"status": status, "q": q, "statuses": STATUS_FA},
+            btns.append({"form": {"action": f"/orders/{o['public_id']}/refund", "label": "لغو و بازپرداخت Stars", "confirm": "بازپرداخت انجام و غیرقابل بازگشت است. ادامه؟", "danger": True}})
+        spec = o.get("delivery_spec") or {}
+        uname = names.get(o["user_id"])
+        rows.append([o["public_id"][:8], (f"@{uname} " if uname else "") + str(o["user_id"]),
+                     f"{o['product_name']} × {o['quantity']}", DELIVERY_FA.get(spec.get("delivery") or "manual", "دستی"),
+                     f"{o['total_toman']:,}", o.get("stars_amount") or "—",
+                     STATUS_FA.get(o["status"], o["status"]) + (" ⚠ تحویل دستی" if o.get("fulfillment_status") == "MANUAL_PENDING" else ""),
+                     o.get("fulfillment_error") or "", str(o["created_at"])[:16], btns])
+    statuses = {**STATUS_FA, MANUAL_FILTER: "⚠ نیازمند تحویل دستی"}
+    return render(request, admin, "page.html", title="سفارش‌ها", forms=[], filters={"status": status, "q": q, "statuses": statuses},
                   pager={"page": page, "pages": (total + per - 1) // per, "base": f"/orders?status={status}&q={q}"},
-                  tables=[{"title": f"{total} سفارش", "columns": ["شناسه", "کاربر", "محصول", "مبلغ (تومان)", "Stars", "وضعیت", "خطا", "زمان", "عملیات"], "rows": rows}])
+                  tables=[{"title": f"{total} سفارش", "columns": ["شناسه", "گیرنده", "محصول", "تحویل", "مبلغ (تومان)", "Stars", "وضعیت", "خطا", "زمان", "عملیات"], "rows": rows}])
 
 
 @router.post("/orders/{oid}/retry")
@@ -382,31 +636,23 @@ async def users_page(request: Request, admin=Depends(auth.current_admin)):
         {"title": "کاربران اخیر", "columns": ["شناسه", "یوزرنیم", "نام", "دعوت‌شده", "عضویت", "وضعیت"], "rows": rows}])
 
 
-# ---------------- suppliers / tickets / audit ----------------
+# ---------------- delivery & Telegram status / tickets / audit ----------------
 @router.get("/suppliers", response_class=HTMLResponse)
 async def suppliers_page(request: Request, admin=Depends(auth.current_admin)):
     need_any(admin, "suppliers")
     db = get_db()
-    rows = [[s["key"], s["name"], s["type"], "فعال" if s.get("enabled") else "غیرفعال"] async for s in db.suppliers.find({})]
-    errs = [[str(e["updated_at"])[:16], e["order_id"][:8], e["status"], e.get("message", "")]
-            async for e in db.supplier_orders.find({"status": "FAILED"}).sort("updated_at", -1).limit(30)]
-    form = {"action": "/suppliers/save", "title": "افزودن تأمین‌کننده", "submit": "ذخیره", "fields": [
-        form_field("key", "کلید (انگلیسی)", required=True), form_field("name", "نام", required=True),
-        form_field("type", "نوع", type_="select", options=[("manual", "دستی"), ("api", "API (نیازمند پیاده‌سازی)"), ("mock", "Mock (فقط توسعه)")]),
-        form_field("enabled", "فعال", type_="select", options=[("1", "بله"), ("0", "خیر")])]}
-    return render(request, admin, "page.html", title="تأمین‌کنندگان", forms=[form], tables=[
-        {"title": "تأمین‌کنندگان", "columns": ["کلید", "نام", "نوع", "وضعیت"], "rows": rows},
-        {"title": "خطاهای تأمین‌کننده", "columns": ["زمان", "سفارش", "وضعیت", "پیام"], "rows": errs}])
-
-
-@router.post("/suppliers/save")
-async def suppliers_save(request: Request, admin=Depends(auth.current_admin), csrf: str = Form(""), key: str = Form(...),
-                         name: str = Form(...), type: str = Form("manual"), enabled: str = Form("1")):
-    auth.check_csrf(request, csrf)
-    need_any(admin, "suppliers")
-    await get_db().suppliers.update_one({"key": key.strip()}, {"$set": {"name": name.strip(), "type": type, "enabled": enabled == "1"}}, upsert=True)
-    await audit(admin["username"], "supplier_save", key)
-    return back(request, "/suppliers", "ذخیره شد.")
+    sup = await telegram_supply.get_supply_status()
+    status_rows = [
+        ["آخرین همگام‌سازی با تلگرام", str(sup.get("checked_at") or "—")[:19]],
+        ["وضعیت", "موفق" if sup.get("ok") else f"خطا: {sup.get('error') or 'هنوز انجام نشده'}"],
+        ["تعداد گیفت‌های موجود در تلگرام", sup.get("gifts_count") if sup.get("gifts_count") is not None else "—"],
+        ["موجودی Stars ربات", sup.get("bot_balance") if sup.get("bot_balance") is not None else (sup.get("balance_error") or "—")],
+    ]
+    errs = [[str(e.get("updated_at"))[:16], e["order_id"][:8], e.get("status", ""), e.get("send_state") or "", e.get("message", "")]
+            async for e in db.supplier_orders.find({"$or": [{"status": "FAILED"}, {"send_state": "SENDING"}]}).sort("updated_at", -1).limit(30)]
+    return render(request, admin, "page.html", title="تأمین و تحویل", forms=[], tables=[
+        {"title": "وضعیت اتصال به تلگرام (تأمین‌کننده شما)", "columns": ["مورد", "مقدار"], "rows": status_rows},
+        {"title": "خطاهای تحویل (SENDING = نتیجه ارسال نامشخص؛ دستی بررسی کنید)", "columns": ["زمان", "سفارش", "وضعیت", "ارسال", "پیام"], "rows": errs}])
 
 
 @router.get("/tickets", response_class=HTMLResponse)

@@ -1,7 +1,6 @@
 """Runtime settings stored in MongoDB (editable from the admin dashboard)."""
 from __future__ import annotations
 
-from config import get_config
 from db import get_db
 from money import MoneyError, ROUNDING_MODES, to_decimal, validate_profit
 from util import utcnow
@@ -12,11 +11,13 @@ DEFAULTS: dict[str, str | None] = {
     "rounding_step": "1000",
     "rounding_mode": "up",
     "refresh_interval_minutes": "30",
-    "max_age_minutes": "120",
+    "max_age_minutes": "120",               # automatic rates / Telegram data older than this stop sales
+    "manual_rate_max_age_minutes": "1440",  # a rate typed by hand stops sales after this (default 24h)
     "order_ttl_minutes": "15",
-    "price_provider": None,        # falls back to env PRICE_PROVIDER
-    "rate_provider": None,         # falls back to env RATE_PROVIDER
+    "auto_refresh_enabled": "true",         # scheduled refresh of rates + Telegram prices/availability
+    "auto_delivery_enabled": "true",        # false => Premium/Gift orders wait for manual delivery
     "stars_usd_value": None,       # value of 1 Star in USD for CUSTOMER pricing (admin must set)
+    "stars_cost_usd": None,        # what 1 Star costs YOU in USD (base cost of Stars/Premium/Gift products)
     "stars_payout_usd_value": None,  # what the seller receives per Star (informational margin check)
     "payment_stars_enabled": "true",
     "wallet_payment_enabled": "false",
@@ -28,14 +29,7 @@ async def get_setting(key: str) -> str | None:
     doc = await get_db().settings.find_one({"key": key})
     if doc is not None:
         return doc["value"]
-    val = DEFAULTS.get(key)
-    if val is None:
-        cfg = get_config()
-        if key == "price_provider":
-            return cfg.price_provider
-        if key == "rate_provider":
-            return cfg.rate_provider
-    return val
+    return DEFAULTS.get(key)
 
 
 def _validate(key: str, value: str) -> str:
@@ -45,18 +39,19 @@ def _validate(key: str, value: str) -> str:
     if key == "rounding_mode":
         if value not in ROUNDING_MODES:
             raise MoneyError("invalid rounding mode")
-    elif key in ("rounding_step", "refresh_interval_minutes", "max_age_minutes", "order_ttl_minutes"):
+    elif key in ("rounding_step", "refresh_interval_minutes", "max_age_minutes", "manual_rate_max_age_minutes",
+                 "order_ttl_minutes"):
         if not value.isdigit() or int(value) < 1:
             raise MoneyError(f"{key} must be a positive integer")
         if key == "refresh_interval_minutes" and int(value) < 5:
             raise MoneyError("refresh interval must be >= 5 minutes (avoid API abuse)")
-    elif key in ("stars_usd_value", "stars_payout_usd_value"):
+    elif key in ("stars_usd_value", "stars_payout_usd_value", "stars_cost_usd"):
         if to_decimal(value) <= 0:
             raise MoneyError("value must be positive")
     elif key == "referral_reward_toman":
         if not value.isdigit():
             raise MoneyError("reward must be a whole number")
-    elif key in ("payment_stars_enabled", "wallet_payment_enabled"):
+    elif key in ("payment_stars_enabled", "wallet_payment_enabled", "auto_refresh_enabled", "auto_delivery_enabled"):
         value = "true" if value.lower() in ("1", "true", "yes", "on") else "false"
     elif key not in DEFAULTS:
         raise MoneyError("unknown setting")

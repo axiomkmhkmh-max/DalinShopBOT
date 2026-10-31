@@ -1,27 +1,31 @@
-"""Seed demo data for LOCAL development: categories, products, manual supplier.
-Prices are NOT set here: they come from the pricing engine (manual base price + exchange rate provider).
+"""Optional LOCAL helper: creates the built-in demo data. On Railway you can do the same from the dashboard
+(Products page -> buttons) instead.
 Usage:  python seed.py
 """
 import asyncio
 
-import db as dbmod
-from config import get_config
 import catalog
+import db as dbmod
+import telegram_supply
+from config import get_config
 
 
 async def main():
     cfg = get_config()
     db = await dbmod.init_db(cfg.mongodb_uri, cfg.mongodb_db)
-    await db.suppliers.update_one({"key": "manual"}, {"$set": {"name": "تحویل دستی", "type": "manual", "enabled": True}}, upsert=True)
-    if await db.categories.count_documents({}) == 0:
-        cid = await catalog.save_category("Telegram Premium")
-        await catalog.save_product({
-            "name": "Telegram Premium ۳ ماهه", "description": "اشتراک ۳ ماهه", "kind": "premium", "category_id": cid,
-            "enabled": False,  # enable it in the dashboard after setting its base price
-            "pricing": {"source": "manual", "manual_amount": "1", "manual_currency": "USD"},
-            "supplier_key": "manual", "digital_in_telegram": True})
-        print("demo category/product created (product is DISABLED; set base price and enable it in the dashboard)")
-    print("seed done")
+    n = await telegram_supply.create_premium_products()
+    print(f"{n} Premium packages created (DISABLED: enable them in the dashboard)")
+    if await db.products.count_documents({"kind": "stars"}) == 0:
+        cid = await catalog.save_category("Telegram Stars")
+        for qty in (50, 100, 500):
+            await catalog.save_product({
+                "name": f"{qty} Telegram Stars", "description": f"{qty} استار", "kind": "stars", "category_id": cid,
+                "enabled": False, "amount": qty, "gift_id": None, "delivery": "manual", "supplier_key": "manual",
+                "stock": None, "pricing": {"source": "manual", "manual_amount": str(qty), "manual_currency": "XTR"},
+                "digital_in_telegram": True})
+        print("Stars packages created (DISABLED)")
+    print("seed done. Gifts: use the dashboard button «دریافت گیفت‌ها از تلگرام» (needs the running bot).")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

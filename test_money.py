@@ -79,3 +79,23 @@ def test_floats_are_rejected():
 def test_stars_ceiling():
     assert stars_for_toman(205000, "2000") == 103
     assert stars_for_toman(1, "2000") == 1
+
+
+# ---- Stars price must stay inside the 7000 Toman profit window ----
+def test_stars_price_never_exceeds_profit_cap():
+    from money import stars_for_toman, stars_within_profit_cap
+    cost, tps = 1_500_000, 2000
+    final = 1_507_000                                   # cost + 7000 (max profit)
+    assert stars_for_toman(final, tps) == 754           # plain ceil overshoots: 754 * 2000 - cost = 8000 > 7000
+    assert stars_within_profit_cap(final, tps, cost) == 753
+    assert 753 * tps - cost <= 7000
+
+
+def test_stars_price_never_below_cost():
+    from money import stars_within_profit_cap
+    assert stars_within_profit_cap(1_000_000, 2000, 1_500_000) * 2000 >= 1_500_000   # desired price below cost
+
+
+def test_stars_price_normal_case_unchanged():
+    from money import stars_within_profit_cap
+    assert stars_within_profit_cap(205000, 2000, 200000) == 103

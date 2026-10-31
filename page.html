@@ -52,11 +52,12 @@
       {% for cell in row %}
         {% if cell is iterable and cell is not string and cell and cell[0] is mapping %}
         <td class="cell-actions">{% for b in cell %}
-          <form method="post" action="{{ b.form.action }}" {% if b.form.confirm %}data-confirm="{{ b.form.confirm }}"{% endif %}>
+          {% if b.link %}<a class="btn" href="{{ b.link.href }}">{{ b.link.label }}</a>
+          {% else %}<form method="post" action="{{ b.form.action }}" {% if b.form.confirm %}data-confirm="{{ b.form.confirm }}"{% endif %}>
             <input type="hidden" name="csrf" value="{{ csrf }}">
             {% if b.form.text_field %}<input name="{{ b.form.text_field }}" placeholder="متن" class="mini">{% endif %}
             <button class="btn {{ 'danger' if b.form.danger else '' }}" type="submit">{{ b.form.label }}</button>
-          </form>{% endfor %}</td>
+          </form>{% endif %}{% endfor %}</td>
         {% else %}<td>{{ cell }}</td>{% endif %}
       {% endfor %}
     </tr>{% endfor %}

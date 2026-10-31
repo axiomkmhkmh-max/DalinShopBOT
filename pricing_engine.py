@@ -1,12 +1,18 @@
 """Auto-pricing engine.
 
-Flow (scheduled, interval from admin settings):
-  1. fetch each needed FX rate ONCE (not per product)  -> exchange_rates
-  2. fetch base price per provider-sourced product      -> (in-memory)
-  3. compute final price with Decimal                   -> price_quotes
-A quote is only usable while all of its inputs are fresh (max_age_minutes).
-Stale/failed => PriceUnavailable => the product cannot be bought. The last
-known price is NEVER shown as a live price.
+Inputs
+  * base price of a product (one of):
+      - "telegram": Star cost reported by Telegram (Gift price from getAvailableGifts, Premium package price).
+                    Stored on the product by telegram_supply.sync_supply().
+      - "manual":   amount + currency typed by the admin (IRT / IRR / USD / XTR).
+  * exchange rate USD -> Toman: from the optional rate API (RATE_API_URL ...) or typed by hand (manual).
+  * "XTR" (Telegram Stars) is converted with   stars_cost_usd (what 1 Star costs YOU) x USD rate.
+Output: one quote per product in `price_quotes` (final Toman price, Stars price, cost, profit, timestamps).
+
+A quote is only usable while ALL its inputs are fresh:
+  * automatic inputs (rate API, Telegram data): max_age_minutes
+  * rate typed by hand: manual_rate_max_age_minutes
+Stale/failed => PriceUnavailable => the product cannot be bought. The last known price is NEVER shown as live.
 """
 from __future__ import annotations
 
@@ -15,10 +21,10 @@ from datetime import timedelta
 from decimal import Decimal
 
 from db import get_db
-from money import MoneyError, compute_price, stars_for_toman, to_decimal
+from money import MoneyError, compute_price, stars_within_profit_cap, to_decimal
 import settings as st
-from pricing_providers import PriceProvider, ProviderError, RateProvider
-from util import as_aware, utcnow
+from pricing_providers import ProviderError, RateProvider
+from util import as_aware, redact, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -33,10 +39,27 @@ def _needs_rate(currency: str) -> bool:
     return currency.upper() not in ("IRT", "IRR")
 
 
-async def refresh_rates(rate_provider: RateProvider, currencies: set[str]) -> dict[str, str]:
-    """Returns {currency: 'ok' | error}. A failed fetch keeps the old doc untouched (it will age out)."""
-    db = get_db()
+# ---------------------------------------------------------------- rates
+async def set_manual_rate(currency: str, value) -> None:
+    """Admin typed the rate by hand. Always stamps a new time (re-saving the same value renews it)."""
+    rate = to_decimal(value)
+    if rate <= 0:
+        raise MoneyError("rate must be positive")
+    now = utcnow()
+    await get_db().exchange_rates.update_one(
+        {"_id": currency.upper()},
+        {"$set": {"toman_per_unit": str(rate), "fetched_at": now, "source": "manual",
+                  "last_error": None, "last_attempt_at": now}},
+        upsert=True,
+    )
+
+
+async def refresh_rates(rate_provider: RateProvider | None, currencies: set[str]) -> dict[str, str]:
+    """Returns {currency: 'ok' | error text}. A failed fetch keeps the old doc untouched (it will age out)."""
     result: dict[str, str] = {}
+    if rate_provider is None or not rate_provider.configured:
+        return {cur: "not configured (the manual rate is used)" for cur in sorted(currencies)}
+    db = get_db()
     for cur in sorted(currencies):
         try:
             rate = await rate_provider.get_rate(cur)
@@ -53,13 +76,38 @@ async def refresh_rates(rate_provider: RateProvider, currencies: set[str]) -> di
             )
             result[cur] = "ok"
         except ProviderError as exc:
+            msg = redact(exc)
             await db.exchange_rates.update_one(
-                {"_id": cur}, {"$set": {"last_error": str(exc), "last_attempt_at": utcnow()}}, upsert=True
+                {"_id": cur}, {"$set": {"last_error": msg, "last_attempt_at": utcnow()}}, upsert=True
             )
-            result[cur] = f"error: {exc}"
+            result[cur] = f"error: {msg}"
     return result
 
 
+async def get_rate_doc(currency: str) -> dict:
+    """Rate document {toman_per_unit, fetched_at, source} for a currency, or PriceUnavailable.
+    XTR is derived: stars_cost_usd x USD rate."""
+    cur = currency.upper()
+    db = get_db()
+    if cur == "XTR":
+        usd = await db.exchange_rates.find_one({"_id": "USD"})
+        if not usd or not usd.get("toman_per_unit"):
+            raise PriceUnavailable("no USD rate")
+        cost_usd = await st.get_setting("stars_cost_usd")
+        if not cost_usd:
+            raise PriceUnavailable("stars_cost_usd is not set")
+        return {
+            "toman_per_unit": str(to_decimal(cost_usd) * to_decimal(usd["toman_per_unit"])),
+            "fetched_at": usd.get("fetched_at"),
+            "source": usd.get("source"),
+        }
+    doc = await db.exchange_rates.find_one({"_id": cur})
+    if not doc or not doc.get("toman_per_unit"):
+        raise PriceUnavailable(f"no exchange rate for {currency}")
+    return doc
+
+
+# ---------------------------------------------------------------- quotes
 async def _store_quote(product: dict, base_amount, base_currency: str, base_fetched_at, rate_doc) -> dict:
     profit = product.get("profit_toman") or await st.get_setting("profit_toman")
     breakdown = compute_price(
@@ -72,12 +120,13 @@ async def _store_quote(product: dict, base_amount, base_currency: str, base_fetc
     )
     stars_usd = await st.get_setting("stars_usd_value")
     usd_rate = await get_db().exchange_rates.find_one({"_id": "USD"})
-    toman_per_star = None
-    stars = None
-    receivable = None
+    toman_per_star = stars = stars_equiv = stars_profit = receivable = None
     if stars_usd and usd_rate and usd_rate.get("toman_per_unit"):
         toman_per_star = to_decimal(stars_usd) * to_decimal(usd_rate["toman_per_unit"])
-        stars = stars_for_toman(breakdown.final_toman, toman_per_star)
+        # Stars are what the customer really pays: keep THAT amount inside the 7000 Toman profit cap.
+        stars = stars_within_profit_cap(breakdown.final_toman, toman_per_star, breakdown.cost_toman)
+        stars_equiv = Decimal(stars) * toman_per_star
+        stars_profit = stars_equiv - breakdown.cost_toman
         payout = await st.get_setting("stars_payout_usd_value")
         if payout:
             receivable = str((Decimal(stars) * to_decimal(payout) * to_decimal(usd_rate["toman_per_unit"])).quantize(Decimal("1")))
@@ -92,9 +141,14 @@ async def _store_quote(product: dict, base_amount, base_currency: str, base_fetc
         "final_toman": breakdown.final_toman,
         "toman_per_star": str(toman_per_star) if toman_per_star else None,
         "stars_amount": stars,
+        "stars_equiv_toman": str(stars_equiv.quantize(Decimal("1"))) if stars_equiv is not None else None,
+        "stars_profit_toman": str(stars_profit.quantize(Decimal("1"))) if stars_profit is not None else None,
         "seller_receivable_toman": receivable,   # what the seller actually gets (informational)
         "base_fetched_at": base_fetched_at,
         "rate_fetched_at": rate_doc["fetched_at"] if rate_doc else None,
+        "rate_source": rate_doc.get("source") if rate_doc else None,
+        "usd_rate_fetched_at": usd_rate.get("fetched_at") if usd_rate else None,
+        "usd_rate_source": usd_rate.get("source") if usd_rate else None,
         "updated_at": utcnow(),
         "status": "OK",
         "error": None,
@@ -106,83 +160,52 @@ async def _store_quote(product: dict, base_amount, base_currency: str, base_fetc
 async def _mark_quote_error(product_id: str, error: str) -> None:
     await get_db().price_quotes.update_one(
         {"product_id": product_id},
-        {"$set": {"error": error, "last_attempt_at": utcnow()}},
+        {"$set": {"error": redact(error), "last_attempt_at": utcnow()}},
         upsert=True,
     )
 
 
-async def recompute_product(product: dict, base_override=None) -> None:
-    """Recompute from cached inputs (no network). base_override = (BasePrice) for provider-sourced products."""
-    db = get_db()
+async def recompute_product(product: dict) -> None:
+    """Recompute one product from cached inputs (no network)."""
     pricing = product.get("pricing") or {}
+    source = pricing.get("source") or "manual"
     try:
-        if base_override is not None:
-            amount, currency, fetched = base_override.amount, base_override.currency, base_override.fetched_at
-        elif pricing.get("source") == "manual":
+        if source == "telegram":
+            sup = product.get("supply") or {}
+            if not sup.get("stars_cost") or not sup.get("checked_at"):
+                raise PriceUnavailable("Telegram price not synced yet")
+            amount, currency, fetched = sup["stars_cost"], "XTR", sup["checked_at"]
+        elif source == "manual":
             amount, currency = pricing["manual_amount"], pricing["manual_currency"]
-            fetched = None  # manual prices are intentional, they do not expire
+            fetched = None  # manual product prices are intentional, they do not expire
         else:
-            cached = await db.price_quotes.find_one({"product_id": product["public_id"]})
-            if not cached or cached.get("base_amount") is None:
-                raise PriceUnavailable("no cached provider price")
-            amount, currency, fetched = cached["base_amount"], cached["base_currency"], cached["base_fetched_at"]
-        rate_doc = None
-        if _needs_rate(currency):
-            rate_doc = await db.exchange_rates.find_one({"_id": currency.upper()})
-            if not rate_doc or not rate_doc.get("toman_per_unit"):
-                raise PriceUnavailable(f"no exchange rate for {currency}")
+            raise PriceUnavailable(f"unknown price source: {source}")
+        rate_doc = await get_rate_doc(currency) if _needs_rate(currency) else None
         await _store_quote(product, amount, currency, fetched, rate_doc)
     except (PriceUnavailable, MoneyError, KeyError) as exc:
         await _mark_quote_error(product["public_id"], str(exc))
 
 
-async def refresh_all(price_provider: PriceProvider, rate_provider: RateProvider, fetch: bool = True) -> dict:
-    """One scheduled cycle. fetch=False only recomputes from cache (e.g. after profit change)."""
+async def refresh_all(rate_provider: RateProvider | None = None, fetch: bool = True) -> dict:
+    """One cycle. fetch=True also asks the rate API; fetch=False only recomputes from cached inputs
+    (after a settings change, a manual rate, a Telegram sync...). Telegram data is synced separately
+    (telegram_supply.sync_supply) BEFORE this runs."""
     db = get_db()
-    products = [p async for p in db.products.find({"enabled": True})]
-    report = {"rates": {}, "products": {}}
+    products = [p async for p in db.products.find({})]
+    report: dict = {"rates": {}, "products": {}}
     if fetch:
-        currencies: set[str] = set()
+        currencies = {"USD"}   # Stars price for the customer always needs the USD rate
         for p in products:
             pr = p.get("pricing") or {}
-            if pr.get("source") == "manual":
-                if _needs_rate(pr.get("manual_currency", "IRT")):
-                    currencies.add(pr["manual_currency"].upper())
-            else:
-                currencies.add("__provider__")
-        provider_needed = "__provider__" in currencies
-        currencies.discard("__provider__")
-        # Stars pricing always needs USD
-        currencies.add("USD")
+            if (pr.get("source") or "manual") == "manual":
+                cur = (pr.get("manual_currency") or "IRT").upper()
+                if _needs_rate(cur) and cur != "XTR":
+                    currencies.add(cur)
         report["rates"] = await refresh_rates(rate_provider, currencies)
-        fetched_prices = {}
-        if provider_needed:
-            for p in products:
-                pr = p.get("pricing") or {}
-                if pr.get("source") != "manual":
-                    ref = pr.get("provider_ref")
-                    if not ref:
-                        continue
-                    try:
-                        fetched_prices[p["public_id"]] = await price_provider.get_base_price(ref)
-                    except ProviderError as exc:
-                        report["products"][p["public_id"]] = f"error: {exc}"
-                        await _mark_quote_error(p["public_id"], f"price fetch failed: {exc}")
-        # rate_provider currencies for provider-sourced products are learned after the first price fetch
-        extra = {bp.currency.upper() for bp in fetched_prices.values() if _needs_rate(bp.currency)}
-        missing = extra - set(report["rates"])
-        if missing:
-            report["rates"].update(await refresh_rates(rate_provider, missing))
-        for p in products:
-            if p["public_id"] in fetched_prices:
-                await recompute_product(p, base_override=fetched_prices[p["public_id"]])
-                report["products"].setdefault(p["public_id"], "ok")
-            elif (p.get("pricing") or {}).get("source") == "manual":
-                await recompute_product(p)
-                report["products"].setdefault(p["public_id"], "ok")
-    else:
-        for p in products:
-            await recompute_product(p)
+    for p in products:
+        await recompute_product(p)
+        q = await db.price_quotes.find_one({"product_id": p["public_id"]})
+        report["products"][p["public_id"]] = "ok" if q and not q.get("error") else ((q or {}).get("error") or "error")
     return report
 
 
@@ -192,14 +215,18 @@ async def get_valid_quote(product_id: str) -> dict:
     q = await db.price_quotes.find_one({"product_id": product_id})
     if not q or q.get("status") != "OK" or not q.get("final_toman"):
         raise PriceUnavailable("no valid quote")
-    max_age = timedelta(minutes=await st.get_int("max_age_minutes"))
+    auto_age = timedelta(minutes=await st.get_int("max_age_minutes"))
+    manual_age = timedelta(minutes=await st.get_int("manual_rate_max_age_minutes"))
     now = utcnow()
-    for field in ("base_fetched_at", "rate_fetched_at"):
+    for field, source in (("base_fetched_at", "telegram"),
+                          ("rate_fetched_at", q.get("rate_source")),
+                          ("usd_rate_fetched_at", q.get("usd_rate_source"))):
         ts = as_aware(q.get(field))
-        if ts is not None and now - ts > max_age:
+        if ts is None:
+            continue
+        limit = manual_age if source == "manual" else auto_age
+        if now - ts > limit:
             raise PriceUnavailable(f"{field} is stale")
-    if q.get("error"):
-        # last refresh attempt failed AFTER this quote was stored; the quote is still within max age, so allow
-        # it, but never if the inputs are older than max_age (checked above).
-        pass
+    # q["error"] set => the LAST refresh failed after this quote was stored. The quote may still be used while
+    # every input is inside its max age (checked above); it can never outlive them.
     return q

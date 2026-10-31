@@ -8,6 +8,7 @@ import keyboards as K
 import texts as T
 from payment_manager import available_methods
 import catalog
+from catalog import AUTO_DELIVERIES
 from util import fa_digits, fmt_toman
 
 router = Router()
@@ -77,8 +78,9 @@ async def product(c: CallbackQuery):
     ok, reason, quote = await catalog.purchasable(p)
     lines = [f"<b>{html.escape(p['name'])}</b>", html.escape(p.get("description", ""))]
     if ok:
-        lines.append(f"قیمت: {fmt_toman(quote['final_toman'])}")
-        lines.append(f"معادل: {fa_digits(quote['stars_amount'])} Stars")
+        lines.append(f"قیمت: {fa_digits(quote['stars_amount'])} Stars")
+        lines.append(f"معادل تقریبی: {fmt_toman(quote['final_toman'])}")
+        lines.append(T.DELIVERY_AUTO if p.get("delivery") in AUTO_DELIVERIES else T.DELIVERY_MANUAL)
     else:
         lines.append(f"⛔️ {reason}")
     await c.message.edit_text("\n".join(x for x in lines if x), reply_markup=K.product_kb(pid, ok, "shop"), parse_mode="HTML")
@@ -108,8 +110,8 @@ async def qty(c: CallbackQuery):
     if not methods:
         await c.answer("روش پرداخت فعالی وجود ندارد.", show_alert=True)
         return
-    total = quote["final_toman"] * qty_i
+    stars_total = quote["stars_amount"] * qty_i
     await c.message.edit_text(
-        f"<b>{html.escape(p['name'])}</b>\nتعداد: {fa_digits(qty_i)}\nمبلغ: {fmt_toman(total)}\n\nروش پرداخت را انتخاب کنید:",
+        f"<b>{html.escape(p['name'])}</b>\nتعداد: {fa_digits(qty_i)}\nمبلغ: {fa_digits(stars_total)} Stars\n\nروش پرداخت را انتخاب کنید:",
         reply_markup=K.payment_methods_kb(pid, qty_i, methods), parse_mode="HTML")
     await c.answer()

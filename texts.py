@@ -19,6 +19,8 @@ PAY_STARS = "⭐ پرداخت با Telegram Stars"
 PAY_WALLET = "👛 پرداخت از کیف پول"
 PAY_MOCK = "🧪 پرداخت آزمایشی"
 CANCEL = "انصراف"
+DELIVERY_AUTO = "⚡ تحویل خودکار، بلافاصله بعد از پرداخت (برای همین حساب شما)"
+DELIVERY_MANUAL = "🕒 تحویل دستی؛ بعد از پرداخت توسط پشتیبانی انجام می‌شود"
 
 TICKET_CATEGORIES = {
     "payment": "مشکل پرداخت", "order": "مشکل سفارش", "product": "مشکل محصول",

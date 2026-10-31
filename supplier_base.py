@@ -1,4 +1,9 @@
-"""Supplier abstraction. No real supplier API is assumed to exist."""
+"""Supplier abstraction.
+
+  manual   -> you deliver by hand from the dashboard (used for Telegram Stars)
+  telegram -> the bot delivers Gifts / Premium through the official Bot API (telegram_supply.py)
+  mock     -> tests / local development only
+"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -62,14 +67,6 @@ class MockSupplier(Supplier):
         return SupplierResult("DELIVERED", "ok", external_ref=f"mock-{req.order_id[:8]}")
 
 
-class ApiSupplier(Supplier):
-    """Placeholder for a real supplier API. You must implement it once you have a real, documented API."""
-    key = "api"
-
-    async def place_order(self, req: SupplierRequest) -> SupplierResult:
-        raise SupplierError("API supplier is not configured")
-
-
 _override: dict[str, Supplier] = {}
 
 
@@ -83,6 +80,9 @@ async def get_supplier(key: str | None) -> Supplier:
         return _override[key]
     if key == "manual":
         return ManualSupplier()
+    if key == "telegram":
+        from telegram_supply import TelegramSupplier   # lazy: avoids an import cycle
+        return TelegramSupplier()
     doc = await get_db().suppliers.find_one({"key": key})
     if not doc or not doc.get("enabled"):
         raise SupplierError("supplier disabled or missing")
@@ -90,6 +90,4 @@ async def get_supplier(key: str | None) -> Supplier:
         if get_config().is_production:
             raise SupplierError("mock supplier forbidden in production")
         return MockSupplier()
-    if doc["type"] == "manual":
-        return ManualSupplier()
-    return ApiSupplier()
+    return ManualSupplier()

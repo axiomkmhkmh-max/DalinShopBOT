@@ -146,3 +146,23 @@ def stars_for_toman(final_toman: int, toman_per_star) -> int:
         raise MoneyError("toman_per_star must be positive")
     stars = (Decimal(final_toman) / tps).to_integral_value(rounding=ROUND_CEILING)
     return max(1, int(stars))
+
+
+def stars_within_profit_cap(final_toman: int, toman_per_star, cost_toman) -> int:
+    """Stars the customer actually pays, kept inside the profit window [cost, cost + 7000 Toman].
+
+    Plain ceil(final / toman_per_star) can overshoot `final` by almost one whole Star (~2000 Toman),
+    which could push the real profit above the 7000 Toman cap. Here the Star count is clamped so that
+    stars * toman_per_star never exceeds cost + 7000 and never drops below cost.
+    If the window is narrower than a single Star (not realistic), "never below cost" wins.
+    """
+    tps = to_decimal(toman_per_star)
+    if tps <= 0:
+        raise MoneyError("toman_per_star must be positive")
+    cost = to_decimal(cost_toman)
+    wanted = stars_for_toman(final_toman, tps)
+    lo = max(1, int((cost / tps).to_integral_value(rounding=ROUND_CEILING)))
+    hi = int(((cost + MAX_PROFIT_TOMAN) / tps).to_integral_value(rounding=ROUND_FLOOR))
+    if hi < lo:
+        return lo
+    return min(max(wanted, lo), hi)

@@ -9,7 +9,7 @@ from pymongo.errors import DuplicateKeyError
 from constants import ALL_STATUSES, OrderStatus as S, can_transition, sources_for
 from db import get_db
 import settings as st
-from catalog import get_product, purchasable
+from catalog import delivery_spec, get_product, purchasable
 from util import as_aware, new_id, utcnow
 
 
@@ -39,10 +39,18 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
 
     unit = int(quote["final_toman"])
     total_toman = unit * quantity
-    stars_total = None
-    if quote.get("toman_per_star"):
-        from money import stars_for_toman
-        stars_total = stars_for_toman(total_toman, quote["toman_per_star"])
+    # Stars are computed PER UNIT (kept inside the 7000 Toman profit cap) and multiplied, so the cap holds per item.
+    stars_total = int(quote["stars_amount"]) * quantity if quote.get("stars_amount") else None
+
+    # Reserve stock (only products with a stock number; empty = unlimited). Released again if the order is
+    # cancelled / expires / is refunded before delivery (see transition()).
+    reserved = 0
+    if product.get("stock") is not None:
+        res = await db.products.update_one({"public_id": product_id, "stock": {"$gte": quantity}},
+                                           {"$inc": {"stock": -quantity}})
+        if res.modified_count != 1:
+            raise OrderError("موجودی کافی نیست")
+        reserved = quantity
     ttl = await st.get_int("order_ttl_minutes")
     oid = new_id()
     order = {
@@ -55,6 +63,8 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
         "total_toman": total_toman,
         "stars_amount": stars_total,
         "price_snapshot": {k: v for k, v in quote.items() if k != "_id"},
+        "delivery_spec": delivery_spec(product),   # frozen: product edits never change a paid order
+        "stock_reserved": reserved,
         "payment_method": payment_method,
         "status": S.PENDING_PAYMENT,
         "payment_status": "UNPAID",
@@ -71,8 +81,21 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
     try:
         await db.orders.insert_one(order)
     except DuplicateKeyError:
+        if reserved:   # somebody else created the same open order first: give the reservation back
+            await db.products.update_one({"public_id": product_id, "stock": {"$ne": None}}, {"$inc": {"stock": reserved}})
         return await db.orders.find_one({"open_key": open_key})
     return order
+
+
+async def _release_stock(order: dict) -> None:
+    """Give reserved stock back exactly once (guarded by the stock_reserved value on the order)."""
+    n = int(order.get("stock_reserved") or 0)
+    if n <= 0:
+        return
+    db = get_db()
+    res = await db.orders.update_one({"public_id": order["public_id"], "stock_reserved": n}, {"$set": {"stock_reserved": 0}})
+    if res.modified_count == 1:
+        await db.products.update_one({"public_id": order["product_id"], "stock": {"$ne": None}}, {"$inc": {"stock": n}})
 
 
 async def get_order(public_id: str) -> dict | None:
@@ -101,11 +124,17 @@ async def transition(public_id: str, to: str, *, from_states: list[str] | None =
         fields["open_key"] = f"closed:{public_id}"
     if set_fields:
         fields.update(set_fields)
-    return await get_db().orders.find_one_and_update(
+    updated = await get_db().orders.find_one_and_update(
         {"public_id": public_id, "status": {"$in": allowed}},
         {"$set": fields, "$push": {"history": {"to": to, "at": now, "note": note}}},
         return_document=ReturnDocument.AFTER,
     )
+    if updated:
+        never_paid = not updated.get("paid_at")
+        undelivered_refund = to == S.REFUNDED and updated.get("fulfillment_status") != "DONE"
+        if (to in (S.CANCELLED, S.FAILED) and never_paid) or undelivered_refund:
+            await _release_stock(updated)
+    return updated
 
 
 async def expire_pending_orders() -> int:

@@ -8,7 +8,7 @@ from db import get_db
 import notifier, orders, wallet
 import settings as st
 from supplier_base import SupplierRequest, get_supplier
-from util import utcnow
+from util import redact, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ async def fulfill_order(order_id: str) -> str:
     if claimed is None:
         return "SKIPPED"                       # someone else claimed it (duplicate protection)
     product = await db.products.find_one({"public_id": order["product_id"]}) or {}
+    product = {**product, **{k: v for k, v in (order.get("delivery_spec") or {}).items() if v is not None}}
     oid_short = order_id[:8]
 
     prior = await db.supplier_orders.find_one({"order_id": order_id})
@@ -63,7 +64,7 @@ async def fulfill_order(order_id: str) -> str:
         )
         status, message, ext, text = result.status, result.message, result.external_ref, result.delivery_text
     except Exception as exc:
-        status, message, ext, text = "FAILED", f"{type(exc).__name__}: {exc}", "", ""
+        status, message, ext, text = "FAILED", redact(f"{type(exc).__name__}: {exc}"), "", ""
 
     await db.supplier_orders.update_one(
         {"order_id": order_id},
@@ -80,13 +81,26 @@ async def fulfill_order(order_id: str) -> str:
     if status == "PENDING":
         await db.orders.update_one({"public_id": order_id}, {"$set": {"fulfillment_status": "MANUAL_PENDING"}})
         await notifier.send_user(order["user_id"], MSG_PENDING.format(oid=oid_short))
-        await notifier.send_admins(f"سفارش {order_id} نیاز به تحویل دستی دارد (پنل ادمین > سفارش‌ها).")
+        await notifier.send_admins(await _manual_alert(order, product, message))
         return "PENDING"
     await orders.transition(order_id, S.FAILED, from_states=[S.PROCESSING],
                             set_fields={"fulfillment_status": "FAILED", "fulfillment_error": message}, note=message)
     await notifier.send_user(order["user_id"], MSG_FAILED.format(oid=oid_short))     # no new charge asked
     await notifier.send_admins(f"تحویل سفارش {order_id} ناموفق بود: {message}")
     return "FAILED"
+
+
+async def _manual_alert(order: dict, product: dict, message: str) -> str:
+    """Everything the admin needs to deliver by hand: what, how many, to whom."""
+    user = await get_db().users.find_one({"telegram_id": order["user_id"]}) or {}
+    who = f"@{user['username']} " if user.get("username") else ""
+    what = product.get("name") or order.get("product_name")
+    amount = f" ({product['amount']})" if product.get("amount") else ""
+    text = (f"🔔 تحویل دستی لازم است\nسفارش: {order['public_id']}\nمحصول: {what}{amount} × {order['quantity']}\n"
+            f"گیرنده: {who}{order['user_id']}\n(پنل ادمین > سفارش‌ها > «تحویل شد»)")
+    if message and message != "manual fulfillment required":
+        text += f"\nعلت: {message}"
+    return text
 
 
 async def _finish(order: dict, delivery_text: str) -> None:
@@ -109,7 +123,8 @@ async def complete_manual(order_id: str, actor: str, delivery_text: str = "") ->
         return False
     await db.supplier_orders.update_one(
         {"order_id": order_id},
-        {"$set": {"status": "DELIVERED", "updated_at": utcnow(), "delivered_by": actor}}, upsert=True)
+        {"$set": {"status": "DELIVERED", "send_state": "IDLE", "updated_at": utcnow(), "delivered_by": actor}},
+        upsert=True)
     await _finish(order, delivery_text)
     return True
 

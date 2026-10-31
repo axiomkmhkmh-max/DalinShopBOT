@@ -25,15 +25,8 @@ class Config(BaseSettings):
     admin_bootstrap_username: str = "owner"
     admin_bootstrap_password: str = ""
 
-    price_provider: str = "http_json"
-    price_api_url: str = ""
-    price_api_key: str = ""
-    price_api_key_header: str = "Authorization"
-    price_api_key_prefix: str = "Bearer"
-    price_json_path: str = ""
-    price_currency: str = "USD"
-
-    rate_provider: str = "http_json"
+    # Optional automatic USD -> Toman rate source (generic JSON API you choose). If empty, set the rate
+    # manually in the dashboard (Pricing page).
     rate_api_url: str = ""
     rate_api_key: str = ""
     rate_api_key_header: str = "Authorization"
@@ -41,7 +34,7 @@ class Config(BaseSettings):
     rate_json_path: str = ""
     rate_unit: str = "IRT"
 
-    enable_mock_payment: bool = False
+    enable_mock_payment: bool = False   # local development only; ignored in production
 
     @property
     def is_production(self) -> bool:

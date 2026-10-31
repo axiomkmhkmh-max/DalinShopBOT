@@ -1,8 +1,10 @@
-"""Configurable Price / Exchange-rate providers.
+"""Exchange-rate provider (USD -> Toman).
 
-Nothing here knows a real vendor API. `HttpJson*` providers call a URL YOU configure
-(env vars) and read a numeric field using a JSON path. API keys come from ENV only.
-Mock providers exist for tests/development and are refused in production.
+Nothing here knows a real vendor API. `HttpJsonRateProvider` calls a URL YOU configure (env vars) and reads a
+numeric field using a JSON path. API keys come from ENV only and are never logged or shown.
+If no URL is configured the provider is simply "not configured" and the rate is typed by hand in the dashboard.
+Product base prices do not need a provider: Telegram Gifts/Premium prices come from the Telegram Bot API
+(see telegram_supply.py) and Stars/other prices are entered in the dashboard.
 """
 from __future__ import annotations
 
@@ -20,13 +22,6 @@ from util import utcnow
 
 class ProviderError(Exception):
     pass
-
-
-@dataclass(frozen=True)
-class BasePrice:
-    amount: Decimal
-    currency: str        # USD / TON / IRT / IRR ...
-    fetched_at: datetime
 
 
 @dataclass(frozen=True)
@@ -63,40 +58,12 @@ async def _http_get_json(url: str, header: str, prefix: str, key: str, timeout: 
         raise ProviderError(f"request failed: {type(exc).__name__}") from exc
 
 
-class PriceProvider(ABC):
-    name = "abstract"
-
-    @abstractmethod
-    async def get_base_price(self, ref: str) -> BasePrice: ...
-
-
 class RateProvider(ABC):
     name = "abstract"
+    configured = True
 
     @abstractmethod
     async def get_rate(self, currency: str) -> Rate: ...
-
-
-class HttpJsonPriceProvider(PriceProvider):
-    name = "http_json"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    async def get_base_price(self, ref: str) -> BasePrice:
-        if not (self.cfg.price_api_url and self.cfg.price_json_path):
-            raise ProviderError("price provider not configured (PRICE_API_URL / PRICE_JSON_PATH)")
-        url = self.cfg.price_api_url.replace("{ref}", ref)
-        data = await _http_get_json(
-            url, self.cfg.price_api_key_header, self.cfg.price_api_key_prefix, self.cfg.price_api_key
-        )
-        try:
-            amount = to_decimal(extract_path(data, self.cfg.price_json_path))
-        except MoneyError as exc:
-            raise ProviderError("invalid price value") from exc
-        if amount <= 0:
-            raise ProviderError("price must be positive")
-        return BasePrice(amount, self.cfg.price_currency.upper(), utcnow())
 
 
 class HttpJsonRateProvider(RateProvider):
@@ -104,6 +71,10 @@ class HttpJsonRateProvider(RateProvider):
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+
+    @property
+    def configured(self) -> bool:  # type: ignore[override]
+        return bool(self.cfg.rate_api_url and self.cfg.rate_json_path)
 
     async def get_rate(self, currency: str) -> Rate:
         if not (self.cfg.rate_api_url and self.cfg.rate_json_path):
@@ -126,21 +97,6 @@ class HttpJsonRateProvider(RateProvider):
         return Rate(value, utcnow(), self.name)
 
 
-class MockPriceProvider(PriceProvider):
-    """TEST/DEV ONLY. Values are injected by the test, never real."""
-    name = "mock"
-
-    def __init__(self, prices: dict[str, tuple[str, str]] | None = None, fail: bool = False):
-        self.prices = prices or {}
-        self.fail = fail
-
-    async def get_base_price(self, ref: str) -> BasePrice:
-        if self.fail or ref not in self.prices:
-            raise ProviderError("mock price failure")
-        amount, cur = self.prices[ref]
-        return BasePrice(to_decimal(amount), cur, utcnow())
-
-
 class MockRateProvider(RateProvider):
     name = "mock"
 
@@ -154,17 +110,5 @@ class MockRateProvider(RateProvider):
         return Rate(to_decimal(self.rates[currency]), utcnow(), self.name)
 
 
-def build_price_provider(name: str, cfg: Config) -> PriceProvider:
-    if name == "http_json":
-        return HttpJsonPriceProvider(cfg)
-    if name == "mock" and not cfg.is_production:
-        return MockPriceProvider()
-    raise ProviderError(f"unknown or forbidden price provider: {name}")
-
-
-def build_rate_provider(name: str, cfg: Config) -> RateProvider:
-    if name == "http_json":
-        return HttpJsonRateProvider(cfg)
-    if name == "mock" and not cfg.is_production:
-        return MockRateProvider()
-    raise ProviderError(f"unknown or forbidden rate provider: {name}")
+def build_rate_provider(cfg: Config) -> RateProvider:
+    return HttpJsonRateProvider(cfg)

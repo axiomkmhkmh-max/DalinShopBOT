@@ -9,7 +9,7 @@ from money import MoneyError
 import catalog, orders
 import settings as st
 import pricing_engine as engine, pricing_providers as providers
-from pricing_providers import MockPriceProvider, MockRateProvider, ProviderError
+from pricing_providers import MockRateProvider, ProviderError
 from util import utcnow
 
 
@@ -31,7 +31,7 @@ async def test_profit_setting_above_limit_rejected(db):
 async def test_rounding_is_configurable(shop):
     await st.set_setting("rounding_step", "5000")
     await st.set_setting("rounding_mode", "nearest")
-    await engine.refresh_all(MockPriceProvider(), shop.rates, fetch=False)
+    await engine.refresh_all(shop.rates, fetch=False)
     q = await engine.get_valid_quote(shop.pid)
     assert q["final_toman"] % 5000 == 0
 
@@ -53,7 +53,7 @@ async def test_unconfigured_http_provider_fails_cleanly():
 
 async def test_api_failure_does_not_overwrite_quote(shop):
     before = await engine.get_valid_quote(shop.pid)
-    report = await engine.refresh_all(MockPriceProvider(), MockRateProvider(fail=True), fetch=True)
+    report = await engine.refresh_all(MockRateProvider(fail=True), fetch=True)
     assert report["rates"]["USD"].startswith("error")
     after = await engine.get_valid_quote(shop.pid)      # still within max age, but NOT updated
     assert after["final_toman"] == before["final_toman"]
@@ -76,7 +76,7 @@ async def test_missing_rate_means_not_purchasable(db, sent):
     await st.set_setting("stars_usd_value", "0.02")
     pid = await catalog.save_product({"name": "x", "enabled": True, "kind": "other", "supplier_key": "manual",
                                       "pricing": {"source": "manual", "manual_amount": "2", "manual_currency": "USD"}})
-    await engine.refresh_all(MockPriceProvider(), MockRateProvider(fail=True), fetch=True)
+    await engine.refresh_all(MockRateProvider(fail=True), fetch=True)
     with pytest.raises(engine.PriceUnavailable):
         await engine.get_valid_quote(pid)
 
@@ -85,7 +85,7 @@ async def test_old_order_price_is_frozen_after_rate_update(shop):
     o1 = await orders.create_order(7, shop.pid, 1)
     assert o1["unit_price_toman"] == 205000
     shop.rates.rates["USD"] = "120000"                  # new TEST rate
-    await engine.refresh_all(MockPriceProvider(), shop.rates, fetch=True)
+    await engine.refresh_all(shop.rates, fetch=True)
     fresh = await engine.get_valid_quote(shop.pid)
     assert fresh["final_toman"] == 245000
     again = await orders.get_order(o1["public_id"])
@@ -94,11 +94,93 @@ async def test_old_order_price_is_frozen_after_rate_update(shop):
     assert o2["unit_price_toman"] == 245000
 
 
-async def test_provider_sourced_product(db, sent):
+# ---------------------------------------------------------------- manual rate, Stars base, Telegram base
+async def test_manual_rate_is_used_and_marked_manual(db):
+    await engine.set_manual_rate("USD", "100000")
+    doc = await get_db().exchange_rates.find_one({"_id": "USD"})
+    assert doc["source"] == "manual" and doc["toman_per_unit"] == "100000"
+    with pytest.raises(MoneyError):
+        await engine.set_manual_rate("USD", "0")
+
+
+async def test_manual_rate_has_its_own_longer_expiry(shop):
+    # automatic inputs live 120 min, a rate typed by hand lives 1440 min (both are admin settings)
+    three_hours = utcnow() - timedelta(hours=3)
+    await get_db().price_quotes.update_one(
+        {"product_id": shop.pid}, {"$set": {"rate_fetched_at": three_hours, "usd_rate_fetched_at": three_hours,
+                                            "rate_source": "manual", "usd_rate_source": "manual"}})
+    assert (await engine.get_valid_quote(shop.pid))["final_toman"] == 205000       # manual: still fresh
+    await get_db().price_quotes.update_one({"product_id": shop.pid}, {"$set": {"rate_source": "http_json"}})
+    with pytest.raises(engine.PriceUnavailable):                                    # automatic: stale
+        await engine.get_valid_quote(shop.pid)
+    await get_db().price_quotes.update_one(
+        {"product_id": shop.pid}, {"$set": {"rate_source": "manual", "rate_fetched_at": utcnow() - timedelta(hours=25)}})
+    with pytest.raises(engine.PriceUnavailable):                                    # manual too old (> 24h)
+        await engine.get_valid_quote(shop.pid)
+
+
+async def test_stale_usd_rate_blocks_even_toman_priced_product(db, sent):
     await st.set_setting("stars_usd_value", "0.02")
-    pid = await catalog.save_product({"name": "p", "enabled": True, "kind": "stars", "supplier_key": "manual",
-                                      "pricing": {"source": "provider", "provider_ref": "sku1"}})
-    pp = MockPriceProvider({"sku1": ("3", "USD")})
-    await engine.refresh_all(pp, MockRateProvider({"USD": "100000"}), fetch=True)
-    q = await engine.get_valid_quote(pid)
-    assert q["cost_toman"] == "300000"
+    await engine.set_manual_rate("USD", "100000")
+    pid = await catalog.save_product({"name": "t", "enabled": True, "kind": "other", "supplier_key": "manual",
+                                      "pricing": {"source": "manual", "manual_amount": "200000", "manual_currency": "IRT"}})
+    await engine.refresh_all(None, fetch=False)
+    assert (await engine.get_valid_quote(pid))["stars_amount"]
+    await get_db().price_quotes.update_one(
+        {"product_id": pid}, {"$set": {"usd_rate_fetched_at": utcnow() - timedelta(hours=30)}})
+    with pytest.raises(engine.PriceUnavailable):        # the Stars price depends on the USD rate
+        await engine.get_valid_quote(pid)
+
+
+async def test_unconfigured_rate_api_does_not_overwrite_manual_rate(db):
+    await engine.set_manual_rate("USD", "100000")
+    rep = await engine.refresh_rates(providers.HttpJsonRateProvider(Config(rate_api_url="", rate_json_path="")), {"USD"})
+    assert rep["USD"].startswith("not configured")
+    doc = await get_db().exchange_rates.find_one({"_id": "USD"})
+    assert doc["source"] == "manual" and doc["last_error"] is None
+
+
+async def test_stars_base_price_uses_cost_per_star(tg):
+    q = await engine.get_valid_quote(tg.stars)
+    assert q["base_currency"] == "XTR" and q["base_amount"] == "100"
+    assert q["cost_toman"] == "150000.000"             # 100 Stars x (0.015 USD x 100000)
+    assert q["final_toman"] == 155000                  # + 5000 profit
+    assert q["stars_amount"] == 78                     # ceil(155000/2000) = 78 -> 156000 <= 157000 cap
+
+
+async def test_xtr_product_needs_stars_cost_setting(db, sent):
+    await engine.set_manual_rate("USD", "100000")
+    await st.set_setting("stars_usd_value", "0.02")
+    pid = await catalog.save_product({"name": "s", "enabled": True, "kind": "stars", "supplier_key": "manual",
+                                      "pricing": {"source": "manual", "manual_amount": "100", "manual_currency": "XTR"}})
+    await engine.refresh_all(None, fetch=False)
+    with pytest.raises(engine.PriceUnavailable):
+        await engine.get_valid_quote(pid)
+
+
+async def test_telegram_priced_products(tg):
+    gift = await engine.get_valid_quote(tg.gift)
+    assert gift["cost_toman"] == "75000.000" and gift["final_toman"] == 80000 and gift["stars_amount"] == 40
+    prem = await engine.get_valid_quote(tg.prem)
+    assert prem["cost_toman"] == "1500000.000" and prem["final_toman"] == 1505000 and prem["stars_amount"] == 753
+    assert int(prem["stars_profit_toman"]) <= 7000
+
+
+async def test_real_profit_in_stars_never_above_7000(tg):
+    await st.set_setting("profit_toman", "7000")
+    await engine.refresh_all(None, fetch=False)
+    q = await engine.get_valid_quote(tg.prem)
+    assert q["final_toman"] == 1507000
+    assert q["stars_amount"] == 753 and int(q["stars_profit_toman"]) == 6000     # plain ceil would be 754 => 8000
+
+
+async def test_auto_refresh_switch(tg, fake_bot):
+    import background
+    await st.set_setting("auto_refresh_enabled", "false")
+    assert await background.run_pricing_cycle() is None            # scheduled run is skipped
+    fake_bot.balance = 777
+    assert await background.run_pricing_cycle(force=True) is not None   # manual "refresh now" still works
+    assert (await tg.ts.get_supply_status())["bot_balance"] == 777
+    await st.set_setting("auto_refresh_enabled", "true")
+    await get_db().settings.delete_one({"key": "_pricing_last_run"})
+    assert await background.run_pricing_cycle() is not None
