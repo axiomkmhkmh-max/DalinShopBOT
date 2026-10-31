@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}نمای کلی{% endblock %}
+{% block content %}
+<h1>نمای کلی</h1>
+<div class="stats">
+  {% for label, value, color in stats %}
+  <div class="stat {{ color }}"><div class="stat-label">{{ label }}</div><div class="stat-value">{{ value }}</div></div>
+  {% endfor %}
+</div>
+<div class="grid2">
+  <div class="card"><h2>درآمد ۱۴ روز اخیر (تومان)</h2><canvas id="revChart" height="140"></canvas></div>
+  <div class="card"><h2>وضعیت سفارش‌ها</h2><canvas id="statusChart" height="140"></canvas></div>
+</div>
+<div class="grid2">
+  <div class="card"><h2>آخرین پرداخت‌ها</h2>
+    {% if recent %}<div class="table-wrap"><table><tr><th>روش</th><th>سفارش</th><th>مبلغ</th><th>وضعیت</th></tr>
+    {% for p in recent %}<tr><td>{{ p.provider }}</td><td>{{ p.order_id[:8] }}</td><td>{{ p.amount }} {{ p.currency }}</td><td><span class="badge {{ p.status|lower }}">{{ p.status }}</span></td></tr>{% endfor %}
+    </table></div>{% else %}<div class="empty">هنوز پرداختی ثبت نشده است.</div>{% endif %}
+  </div>
+  <div class="card"><h2>وضعیت تأمین‌کنندگان</h2>
+    {% if sup_status %}<div class="table-wrap"><table>{% for n, s in sup_status %}<tr><td>{{ n }}</td><td>{{ s }}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">تأمین‌کننده‌ای تعریف نشده (حالت دستی).</div>{% endif %}
+  </div>
+</div>
+<script type="application/json" id="chart-data">{{ {"labels": daily|map(attribute="_id")|list, "revenue": daily|map(attribute="revenue")|list, "status_labels": status_counts.keys()|map("string")|list, "status_values": status_counts.values()|list} | tojson }}</script>
+{% endblock %}
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="/static/charts.js"></script>
+{% endblock %}

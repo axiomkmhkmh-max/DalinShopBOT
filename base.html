@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}پنل مدیریت{% endblock %} | TELEGRAM MARKET</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">TELEGRAM<span>MARKET</span></div>
+    <nav>
+      {% for label, href, perm in nav %}
+      <a href="{{ href }}" class="{{ 'active' if path == href else '' }}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <form method="post" action="/logout" class="logout">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="who">{{ admin.username }} · {{ admin.role }}</div>
+      <button class="btn ghost" type="submit">خروج</button>
+    </form>
+  </aside>
+  <main class="content">
+    <button class="menu-toggle" id="menu-toggle" type="button">☰</button>
+    {% if flash %}<div class="toast" data-toast>{{ flash }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<script src="/static/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

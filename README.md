@@ -12,15 +12,15 @@
 | تست‌های دیتابیس‌دار (Stars، تکراری، تحویل ناموفق، کیف پول، نرخ منقضی، snapshot قیمت) | **نوشته شد ولی اجرا نشد** (در محیط ساخت pytest/mongomock نصب نبود) |
 | کد ربات aiogram، پنل FastAPI، اتصال Mongo | **فقط compile/syntax-check شد؛ اجرا نشده** |
 | پرداخت واقعی Stars | **تست نشده.** باید با ربات واقعی خودتان امتحان کنید (قدم‌ها پایین) |
-| TON و درگاه ایرانی | **غیرفعال** (فقط Adapter و توضیح شرایط) |
+| TON | **غیرفعال** (فقط Adapter و توضیح شرایط) |
 | Mock Payment | فقط توسعه؛ در `APP_ENV=production` همیشه رد می‌شود |
 
 قبل از فروش واقعی، دستور `pytest` را اجرا کنید و با یک خرید کوچک واقعی Stars چرخه کامل را تست کنید.
 
 ## قانون تلگرام و روش‌های پرداخت
-برای محصولات دیجیتال داخل ربات، **فقط Stars** فعال است. TON و درگاه ایرانی برای این محصولات هرگز به مشتری نشان داده نمی‌شوند
-(`app/payments/manager.py`) و راه دور زدن ساخته نشده. فایل‌های `ton.py` و `iran_gateway.py` شرایط لازم برای فعال‌سازی
-(مجوز، قرارداد، API رسمی، تأیید سرور) را در توضیح بالای فایل نوشته‌اند. این دو فقط برای محصول/سرویس مستقلی که طبق قوانین تلگرام و قانون کشور مجاز به پرداخت بیرونی باشد قابل استفاده‌اند.
+برای محصولات دیجیتال داخل ربات، **فقط Stars** فعال است. TON برای این محصولات هرگز به مشتری نشان داده نمی‌شود
+(`payment_manager.py`) و راه دور زدن ساخته نشده. فایل `payment_ton.py` شرایط لازم برای فعال‌سازی
+(مجوز، قرارداد، API رسمی، تأیید سرور) را در توضیح بالای فایل نوشته‌اند. فقط برای محصول/سرویس مستقلی که طبق قوانین تلگرام و قانون کشور مجاز به پرداخت بیرونی باشد قابل استفاده است.
 
 ## راه‌اندازی روی Railway (قدم‌به‌قدم)
 1. در BotFather: `/newbot` → توکن را نگه دارید. (Stars نیاز به provider token ندارد.)
@@ -40,7 +40,7 @@
 8. آدرس دامنه را باز کنید → `/login` → با ادمین اولیه وارد شوید. بعد از ورود، رمز را در `.env`/Variables عوض نکنید؛ ادمین جدید فقط وقتی ساخته می‌شود که هیچ ادمینی نباشد.
 
 ### داده اولیه
-محلی: `python -m scripts.seed` (دسته‌بندی/محصول نمونه + تأمین‌کننده دستی). یا همه چیز را از پنل بسازید.
+محلی: `python seed.py` (دسته‌بندی/محصول نمونه + تأمین‌کننده دستی). یا همه چیز را از پنل بسازید.
 
 ## راه‌اندازی پرداخت Stars (خلاصه)
 1. توکن ربات را در Variables بگذارید. 2. در پنل > قیمت‌گذاری مقدار **«ارزش هر Star برای مشتری (USD)»** را خودتان وارد کنید (تلگرام API رسمی برای این نرخ نمی‌دهد؛ هیچ عددی هاردکد نشده).
@@ -57,16 +57,20 @@
 - هنوز به **API Key / تأمین‌کننده واقعی** نیاز دارند: قیمت پایه (برای محصولات provider)، نرخ USD→تومان (و TON اگر لازم)، و تأمین‌کننده تحویل (Premium/Stars/Gift).
 
 ## ساختار
+همه فایل‌ها در یک پوشه (بدون زیرپوشه) هستند و با پیشوند دسته‌بندی شده‌اند:
 ```
-app/main.py            FastAPI + webhook + شروع ربات و کارهای پس‌زمینه
-app/money.py           محاسبات Decimal، سقف سود، گرد کردن
-app/services/pricing/  providers.py (منابع قابل تعویض) · engine.py (محاسبه/ذخیره/اعتبار)
-app/payments/          stars.py (کامل) · ton.py/iran_gateway.py (غیرفعال) · mock.py (توسعه) · wallet_provider.py · manager.py
-app/services/          orders (ماشین وضعیت) · wallet (دفتر کل) · fulfillment · catalog · settings
-app/suppliers/         manual / mock / API (placeholder)
-app/bot/               هندلرها و منوها (فارسی)
-app/web/               پنل ادمین (RTL، تم تیره، Chart.js)
-tests/                 pytest
+main.py                     FastAPI + webhook + شروع ربات و کارهای پس‌زمینه
+money.py                    محاسبات Decimal، سقف سود، گرد کردن
+pricing_providers.py        منابع قابل تعویض قیمت/نرخ
+pricing_engine.py           محاسبه/ذخیره/اعتبار قیمت
+payment_*.py                stars (کامل) · ton (غیرفعال) · mock (توسعه) · wallet · manager · base
+orders / wallet / fulfillment / catalog / settings / users / audit / notifier .py   سرویس‌ها
+supplier_base.py            manual / mock / API (placeholder)
+bot_setup.py handler_*.py keyboards.py texts.py middlewares.py   ربات (فارسی)
+web_routes.py auth.py       پنل ادمین
+base/login/overview/page .html · style.css · app.js · charts.js   قالب‌ها و فایل‌های استاتیک (RTL، تم تیره، Chart.js)
+test_*.py conftest.py       pytest
+seed.py                     داده اولیه
 ```
 
 ## اجرای محلی و تست
@@ -75,7 +79,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env     # مقادیر را پر کنید
 docker run -d -p 27017:27017 mongo:7
-uvicorn app.main:app --reload
+uvicorn main:app --reload
 pytest
 ```
 بدون `PUBLIC_BASE_URL` ربات با long polling اجرا می‌شود.

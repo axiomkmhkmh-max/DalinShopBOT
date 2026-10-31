@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from config import get_config
+from db import get_db
+from pricing_engine import PriceUnavailable, get_valid_quote
+from util import new_id, utcnow
+
+
+async def list_categories() -> list[dict]:
+    return [c async for c in get_db().categories.find({"enabled": True}).sort("sort", 1)]
+
+
+async def list_products(category_id: str | None = None, kind: str | None = None) -> list[dict]:
+    q: dict = {"enabled": True}
+    if category_id:
+        q["category_id"] = category_id
+    if kind:
+        q["kind"] = kind
+    return [p async for p in get_db().products.find(q).sort("sort", 1)]
+
+
+async def get_product(public_id: str) -> dict | None:
+    return await get_db().products.find_one({"public_id": public_id})
+
+
+async def purchasable(product: dict) -> tuple[bool, str, dict | None]:
+    """(ok, reason, quote). A product is never shown as available without a fresh price and a valid supplier."""
+    if not product.get("enabled"):
+        return False, "غیرفعال", None
+    supplier_key = product.get("supplier_key") or "manual"
+    sup = await get_db().suppliers.find_one({"key": supplier_key})
+    if supplier_key == "manual" and sup is None:
+        pass  # built-in manual supplier always exists
+    elif sup is None or not sup.get("enabled"):
+        return False, "تأمین‌کننده فعال نیست", None
+    elif sup.get("type") == "mock" and get_config().is_production:
+        return False, "تأمین‌کننده نامعتبر", None
+    elif sup.get("type") == "api":
+        return False, "تأمین‌کننده API هنوز پیکربندی نشده", None
+    try:
+        quote = await get_valid_quote(product["public_id"])
+    except PriceUnavailable:
+        return False, "قیمت در حال به‌روزرسانی است؛ موقتاً قابل خرید نیست", None
+    if not quote.get("stars_amount"):
+        return False, "نرخ Stars تنظیم نشده است", None
+    return True, "", quote
+
+
+async def save_product(data: dict, public_id: str | None = None) -> str:
+    db = get_db()
+    now = utcnow()
+    if public_id:
+        await db.products.update_one({"public_id": public_id}, {"$set": {**data, "updated_at": now}})
+        return public_id
+    pid = new_id()
+    await db.products.insert_one({"public_id": pid, "created_at": now, "updated_at": now, "sort": 100, **data})
+    return pid
+
+
+async def save_category(name: str, public_id: str | None = None, enabled: bool = True) -> str:
+    db = get_db()
+    if public_id:
+        await db.categories.update_one({"public_id": public_id}, {"$set": {"name": name, "enabled": enabled}})
+        return public_id
+    pid = new_id()
+    await db.categories.insert_one({"public_id": pid, "name": name, "enabled": enabled, "sort": 100})
+    return pid

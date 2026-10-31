@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+
+{% if actions %}<div class="actions">
+  {% for a in actions %}
+  <form method="post" action="{{ a.action }}" data-confirm="اجرا شود؟">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary" type="submit">{{ a.label }}</button>
+  </form>{% endfor %}
+</div>{% endif %}
+
+{% for f in forms %}
+<form class="card form" method="post" action="{{ f.action }}">
+  <h2>{{ f.title }}</h2>
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <div class="fields">
+  {% for fld in f.fields %}
+    <label>{{ fld.label }}
+      {% if fld.type == "select" %}
+      <select name="{{ fld.name }}">
+        {% for o in fld.options %}{% set val = o[0] if o is not string else o %}{% set lab = o[1] if o is not string else o %}
+        <option value="{{ val }}" {{ 'selected' if val|string == fld.value|string else '' }}>{{ lab }}</option>{% endfor %}
+      </select>
+      {% else %}
+      <input name="{{ fld.name }}" value="{{ fld.value or '' }}" {{ 'required' if fld.required else '' }}>
+      {% endif %}
+    </label>
+  {% endfor %}
+  </div>
+  <button class="btn primary" type="submit">{{ f.submit }}</button>
+</form>
+{% endfor %}
+
+{% if filters %}
+<form class="card filters" method="get">
+  <select name="status"><option value="">همه وضعیت‌ها</option>
+    {% for k, v in filters.statuses.items() %}<option value="{{ k }}" {{ 'selected' if k == filters.status else '' }}>{{ v }}</option>{% endfor %}
+  </select>
+  <input name="q" value="{{ filters.q }}" placeholder="شناسه سفارش یا کاربر">
+  <button class="btn" type="submit">جستجو</button>
+</form>
+{% endif %}
+
+{% for t in tables %}
+<div class="card">
+  <h2>{{ t.title }}</h2>
+  {% if t.rows %}
+  <div class="table-wrap"><table>
+    <tr>{% for c in t.columns %}<th>{{ c }}</th>{% endfor %}</tr>
+    {% for row in t.rows %}<tr>
+      {% for cell in row %}
+        {% if cell is iterable and cell is not string and cell and cell[0] is mapping %}
+        <td class="cell-actions">{% for b in cell %}
+          <form method="post" action="{{ b.form.action }}" {% if b.form.confirm %}data-confirm="{{ b.form.confirm }}"{% endif %}>
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            {% if b.form.text_field %}<input name="{{ b.form.text_field }}" placeholder="متن" class="mini">{% endif %}
+            <button class="btn {{ 'danger' if b.form.danger else '' }}" type="submit">{{ b.form.label }}</button>
+          </form>{% endfor %}</td>
+        {% else %}<td>{{ cell }}</td>{% endif %}
+      {% endfor %}
+    </tr>{% endfor %}
+  </table></div>
+  {% else %}<div class="empty">موردی برای نمایش وجود ندارد.</div>{% endif %}
+</div>
+{% endfor %}
+
+{% if pager and pager.pages > 1 %}
+<div class="pager">
+  {% for p in range(1, pager.pages + 1) %}<a class="{{ 'active' if p == pager.page else '' }}" href="{{ pager.base }}&page={{ p }}">{{ p }}</a>{% endfor %}
+</div>{% endif %}
+{% endblock %}

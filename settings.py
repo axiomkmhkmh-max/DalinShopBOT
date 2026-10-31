@@ -1,0 +1,83 @@
+"""Runtime settings stored in MongoDB (editable from the admin dashboard)."""
+from __future__ import annotations
+
+from config import get_config
+from db import get_db
+from money import MoneyError, ROUNDING_MODES, to_decimal, validate_profit
+from util import utcnow
+
+# NOTE: no live rate / price is hardcoded here. Missing values mean "not configured".
+DEFAULTS: dict[str, str | None] = {
+    "profit_toman": "0",
+    "rounding_step": "1000",
+    "rounding_mode": "up",
+    "refresh_interval_minutes": "30",
+    "max_age_minutes": "120",
+    "order_ttl_minutes": "15",
+    "price_provider": None,        # falls back to env PRICE_PROVIDER
+    "rate_provider": None,         # falls back to env RATE_PROVIDER
+    "stars_usd_value": None,       # value of 1 Star in USD for CUSTOMER pricing (admin must set)
+    "stars_payout_usd_value": None,  # what the seller receives per Star (informational margin check)
+    "payment_stars_enabled": "true",
+    "wallet_payment_enabled": "false",
+    "referral_reward_toman": "0",
+}
+
+
+async def get_setting(key: str) -> str | None:
+    doc = await get_db().settings.find_one({"key": key})
+    if doc is not None:
+        return doc["value"]
+    val = DEFAULTS.get(key)
+    if val is None:
+        cfg = get_config()
+        if key == "price_provider":
+            return cfg.price_provider
+        if key == "rate_provider":
+            return cfg.rate_provider
+    return val
+
+
+def _validate(key: str, value: str) -> str:
+    value = str(value).strip()
+    if key == "profit_toman":
+        return str(validate_profit(value))           # raises if outside 0..7000
+    if key == "rounding_mode":
+        if value not in ROUNDING_MODES:
+            raise MoneyError("invalid rounding mode")
+    elif key in ("rounding_step", "refresh_interval_minutes", "max_age_minutes", "order_ttl_minutes"):
+        if not value.isdigit() or int(value) < 1:
+            raise MoneyError(f"{key} must be a positive integer")
+        if key == "refresh_interval_minutes" and int(value) < 5:
+            raise MoneyError("refresh interval must be >= 5 minutes (avoid API abuse)")
+    elif key in ("stars_usd_value", "stars_payout_usd_value"):
+        if to_decimal(value) <= 0:
+            raise MoneyError("value must be positive")
+    elif key == "referral_reward_toman":
+        if not value.isdigit():
+            raise MoneyError("reward must be a whole number")
+    elif key in ("payment_stars_enabled", "wallet_payment_enabled"):
+        value = "true" if value.lower() in ("1", "true", "yes", "on") else "false"
+    elif key not in DEFAULTS:
+        raise MoneyError("unknown setting")
+    return value
+
+
+async def set_setting(key: str, value: str) -> str:
+    value = _validate(key, value)
+    await get_db().settings.update_one(
+        {"key": key}, {"$set": {"value": value, "updated_at": utcnow()}}, upsert=True
+    )
+    return value
+
+
+async def get_int(key: str) -> int:
+    return int(await get_setting(key) or DEFAULTS[key])
+
+
+async def get_bool(key: str) -> bool:
+    return (await get_setting(key) or "false") == "true"
+
+
+async def all_settings() -> dict[str, str | None]:
+    return {k: await get_setting(k) for k in DEFAULTS}
