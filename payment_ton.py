@@ -18,6 +18,7 @@ from payment_base import PaymentInit, PaymentProvider, ProviderDisabled
 class TonProvider(PaymentProvider):
     key = "ton"
     display_name = "پرداخت با TON (کیف‌به‌کیف)"
+    external = True
 
     async def is_enabled(self) -> bool:
         return False

@@ -15,7 +15,7 @@ from db import get_db
 from money import MoneyError, to_decimal, validate_profit
 from payment_manager import get_provider
 import background_hooks as hooks
-import catalog, fulfillment, orders, telegram_supply, wallet
+import catalog, fulfillment, orders, stars_delivery, telegram_supply, wallet
 import pricing_engine as engine
 import settings as st
 from audit import audit
@@ -34,7 +34,7 @@ NAV = [  # (label, path, permission)
     ("قیمت‌گذاری", "/pricing", "pricing_view"), ("سفارش‌ها", "/orders", "orders_view"),
     ("پرداخت‌ها", "/payments", "payments"), ("کیف پول‌ها", "/wallets", "wallets_adjust"),
     ("کاربران", "/users", "users"), ("تأمین و تحویل", "/suppliers", "suppliers"),
-    ("پشتیبانی", "/tickets", "support"), ("لاگ ممیزی", "/audit", "audit"),
+    ("پشتیبانی", "/tickets", "support"), ("خطاها", "/errors", "orders_view"), ("لاگ ممیزی", "/audit", "audit"),
 ]
 
 
@@ -228,7 +228,7 @@ def _parse_product(f: dict) -> dict:
     if kind == "stars":
         if not amount:
             raise ValueError("برای Stars تعداد Star را وارد کنید")
-        delivery, gift_id = "manual", None          # no Bot API can send plain Stars: always manual
+        delivery, gift_id = "stars_auto", None      # automatic only if a real sender exists (none today) -> manual
         if price_source == "telegram":
             raise ValueError("قیمت Stars از تلگرام خوانده نمی‌شود؛ منبع قیمت را «دستی» بگذارید")
     elif kind == "premium":
@@ -269,7 +269,7 @@ def _parse_product(f: dict) -> dict:
         stock_val = None
     return {"name": f["name"].strip(), "description": f["description"].strip(), "category_id": f["category_id"] or None,
             "kind": kind, "amount": amount, "gift_id": gift_id, "delivery": delivery, "pricing": pricing,
-            "supplier_key": "telegram" if delivery in AUTO_DELIVERIES else "manual", "profit_toman": profit or None,
+            "supplier_key": "telegram" if delivery in AUTO_DELIVERIES else ("stars" if delivery == "stars_auto" else "manual"), "profit_toman": profit or None,
             "stock": stock_val, "enabled": f["enabled"] == "1", "digital_in_telegram": True}
 
 
@@ -448,6 +448,7 @@ async def pricing_page(request: Request, admin=Depends(auth.current_admin)):
               form_field("refresh_interval_minutes", "بازه به‌روزرسانی (دقیقه، حداقل ۵)", s["refresh_interval_minutes"]),
               form_field("max_age_minutes", "حداکثر عمر نرخ/داده خودکار (دقیقه) — بعدش فروش متوقف می‌شود", s["max_age_minutes"]),
               form_field("manual_rate_max_age_minutes", "حداکثر عمر نرخ دستی (دقیقه) — بعدش فروش متوقف می‌شود", s["manual_rate_max_age_minutes"]),
+              form_field("stars_auto_min", "حداقل Stars برای تحویل خودکار Stars (فقط وقتی روش رسمی ارسال وجود داشته باشد)", s["stars_auto_min"]),
               form_field("auto_delivery_enabled", "تحویل خودکار Premium/Gift", s["auto_delivery_enabled"], "select", [("true", "روشن"), ("false", "خاموش")]),
               form_field("order_ttl_minutes", "مهلت پرداخت سفارش (دقیقه)", s["order_ttl_minutes"])]
     forms = []
@@ -483,7 +484,7 @@ async def pricing_settings(request: Request, admin=Depends(auth.current_admin), 
     changed = []
     try:
         for key in ("profit_toman", "rounding_step", "rounding_mode", "refresh_interval_minutes", "max_age_minutes",
-                    "manual_rate_max_age_minutes", "order_ttl_minutes", "stars_usd_value", "stars_cost_usd",
+                    "manual_rate_max_age_minutes", "order_ttl_minutes", "stars_auto_min", "stars_usd_value", "stars_cost_usd",
                     "stars_payout_usd_value", "auto_refresh_enabled", "auto_delivery_enabled"):
             val = (form.get(key) or "").strip()
             if val == "" and key in ("stars_usd_value", "stars_cost_usd", "stars_payout_usd_value"):
@@ -509,16 +510,25 @@ async def pricing_refresh(request: Request, admin=Depends(auth.current_admin), c
 
 # ---------------- orders ----------------
 MANUAL_FILTER = "MANUAL"
+PAY_STATUS_FA = {"UNPAID": "پرداخت‌نشده", "PAID": "پرداخت‌شده", "REFUNDED": "بازپرداخت‌شده"}
+DELIVERY_STATUS_FA = {"NONE": "شروع نشده", "PROCESSING": "در حال تحویل", "MANUAL_PENDING": "نیازمند تحویل دستی",
+                      "DONE": "تحویل‌شده", "FAILED": "تحویل ناموفق"}
+METHOD_FA = {"stars": "Stars", "wallet": "کیف پول", "mock": "آزمایشی"}
 
 
 @router.get("/orders", response_class=HTMLResponse)
-async def orders_page(request: Request, status: str = "", q: str = "", page: int = 1, admin=Depends(auth.current_admin)):
+async def orders_page(request: Request, status: str = "", q: str = "", pay: str = "", deliv: str = "", page: int = 1,
+                      admin=Depends(auth.current_admin)):
     need_any(admin, "orders_view", "orders")
     flt: dict = {}
     if status == MANUAL_FILTER:
         flt = {"status": S.PROCESSING, "fulfillment_status": "MANUAL_PENDING"}
     elif status in STATUS_FA:
         flt["status"] = status
+    if pay in PAY_STATUS_FA:
+        flt["payment_status"] = pay
+    if deliv in DELIVERY_STATUS_FA:
+        flt["fulfillment_status"] = deliv
     if q:
         flt["$or"] = [{"public_id": {"$regex": "^" + re.escape(q[:32])}}, {"user_id": int(q)} if q.isdigit() else {"public_id": "x"}]
     per = 25
@@ -528,7 +538,7 @@ async def orders_page(request: Request, status: str = "", q: str = "", page: int
     names = {u["telegram_id"]: u.get("username") async for u in db.users.find({"telegram_id": {"$in": [o["user_id"] for o in items]}})}
     rows = []
     for o in items:
-        btns = []
+        btns = [{"link": {"href": f"/orders/{o['public_id']}", "label": "جزئیات"}}]
         if can(admin, "orders"):
             if o["status"] == S.FAILED:
                 btns.append({"form": {"action": f"/orders/{o['public_id']}/retry", "label": "تلاش مجدد تحویل", "confirm": "تحویل دوباره انجام شود؟"}})
@@ -540,13 +550,68 @@ async def orders_page(request: Request, status: str = "", q: str = "", page: int
         uname = names.get(o["user_id"])
         rows.append([o["public_id"][:8], (f"@{uname} " if uname else "") + str(o["user_id"]),
                      f"{o['product_name']} × {o['quantity']}", DELIVERY_FA.get(spec.get("delivery") or "manual", "دستی"),
-                     f"{o['total_toman']:,}", o.get("stars_amount") or "—",
-                     STATUS_FA.get(o["status"], o["status"]) + (" ⚠ تحویل دستی" if o.get("fulfillment_status") == "MANUAL_PENDING" else ""),
-                     o.get("fulfillment_error") or "", str(o["created_at"])[:16], btns])
+                     f"{o.get('amount', o.get('stars_amount')) or '—'} {o.get('currency', 'XTR')}",
+                     METHOD_FA.get(o.get("payment_method"), o.get("payment_method")),
+                     PAY_STATUS_FA.get(o.get("payment_status"), o.get("payment_status")),
+                     DELIVERY_STATUS_FA.get(o.get("fulfillment_status"), o.get("fulfillment_status")),
+                     STATUS_FA.get(o["status"], o["status"]),
+                     o.get("fulfillment_error") or o.get("manual_reason") or "", str(o["created_at"])[:16], btns])
     statuses = {**STATUS_FA, MANUAL_FILTER: "⚠ نیازمند تحویل دستی"}
-    return render(request, admin, "page.html", title="سفارش‌ها", forms=[], filters={"status": status, "q": q, "statuses": statuses},
-                  pager={"page": page, "pages": (total + per - 1) // per, "base": f"/orders?status={status}&q={q}"},
-                  tables=[{"title": f"{total} سفارش", "columns": ["شناسه", "گیرنده", "محصول", "تحویل", "مبلغ (تومان)", "Stars", "وضعیت", "خطا", "زمان", "عملیات"], "rows": rows}])
+    base = f"/orders?status={status}&q={q}&pay={pay}&deliv={deliv}"
+    return render(request, admin, "page.html", title="سفارش‌ها", forms=[],
+                  filters={"status": status, "q": q, "statuses": statuses, "pay": pay, "deliv": deliv,
+                           "pay_statuses": PAY_STATUS_FA, "deliv_statuses": DELIVERY_STATUS_FA},
+                  pager={"page": page, "pages": (total + per - 1) // per, "base": base},
+                  tables=[{"title": f"{total} سفارش", "columns": ["شناسه", "گیرنده", "محصول", "تحویل", "مبلغ پرداخت", "روش", "وضعیت پرداخت", "وضعیت تحویل", "وضعیت سفارش", "خطا / علت", "زمان", "عملیات"], "rows": rows}])
+
+
+@router.get("/orders/{oid}", response_class=HTMLResponse)
+async def order_detail_page(oid: str, request: Request, admin=Depends(auth.current_admin)):
+    need_any(admin, "orders_view", "orders")
+    db = get_db()
+    o = await db.orders.find_one({"public_id": oid})
+    if not o:
+        return back(request, "/orders", "سفارش پیدا نشد.")
+    user = await db.users.find_one({"telegram_id": o["user_id"]}) or {}
+    pay = [p async for p in db.payments.find({"order_id": oid})]
+    sup = await db.supplier_orders.find_one({"order_id": oid}) or {}
+    snap = o.get("price_snapshot") or {}
+    ts = lambda v: str(v)[:19] if v else "—"
+    info = [["شناسه سفارش", oid], ["مشتری", f"{('@' + user['username'] + ' ') if user.get('username') else ''}{o['user_id']}"],
+            ["محصول × تعداد", f"{o['product_name']} × {o['quantity']}"],
+            ["مبلغ پرداخت", f"{o.get('amount', o.get('stars_amount')) or '—'} {o.get('currency', 'XTR')}"],
+            ["قیمت تومانی ثابت‌شده (snapshot)", f"{o['total_toman']:,} تومان"],
+            ["قیمت خرید در لحظه سفارش (تومان)", _int_str(snap["cost_toman"]) if snap.get("cost_toman") else "—"],
+            ["روش پرداخت", METHOD_FA.get(o.get("payment_method"), o.get("payment_method"))],
+            ["وضعیت پرداخت", PAY_STATUS_FA.get(o.get("payment_status"), o.get("payment_status"))],
+            ["وضعیت تحویل", DELIVERY_STATUS_FA.get(o.get("fulfillment_status"), o.get("fulfillment_status"))],
+            ["وضعیت سفارش", STATUS_FA.get(o["status"], o["status"])],
+            ["زمان ایجاد", ts(o.get("created_at"))], ["زمان پرداخت", ts(o.get("paid_at"))],
+            ["زمان تحویل", ts(o.get("completed_at"))],
+            ["شناسه پیگیری پرداخت", o.get("paid_charge_id") or "—"],
+            ["علت تحویل دستی", o.get("manual_reason") or "—"], ["خطای تحویل", o.get("fulfillment_error") or "—"],
+            ["تلاش‌های تحویل", sup.get("attempts", 0)], ["وضعیت ارسال", sup.get("send_state") or "—"]]
+    return render(request, admin, "page.html", title=f"سفارش {oid[:8]}", forms=[], tables=[
+        {"title": "اطلاعات سفارش", "columns": ["مورد", "مقدار"], "rows": info},
+        {"title": "پرداخت‌ها", "columns": ["شناسه", "روش", "مبلغ", "وضعیت", "زمان"],
+         "rows": [[p["_id"][:30], p["provider"], f"{p['amount']} {p['currency']}", p["status"], ts(p.get("created_at"))] for p in pay]},
+        {"title": "تاریخچه تغییر وضعیت", "columns": ["زمان", "وضعیت", "یادداشت"],
+         "rows": [[ts(h.get("at")), STATUS_FA.get(h.get("to"), h.get("to")), h.get("note", "")] for h in o.get("history", [])]}])
+
+
+@router.get("/errors", response_class=HTMLResponse)
+async def errors_page(request: Request, admin=Depends(auth.current_admin)):
+    need_any(admin, "orders_view", "orders", "payments")
+    db = get_db()
+    ts = lambda v: str(v)[:16] if v else "—"
+    pay_err = [[ts(p.get("created_at")), p["_id"][:28], p.get("order_id", "")[:8], p["status"], f"{p['amount']} {p['currency']}"]
+               async for p in db.payments.find({"status": {"$in": ["MISMATCH", "NEEDS_REFUND", "ORPHAN"]}}).sort("created_at", -1).limit(50)]
+    deliv_err = [[ts(o.get("updated_at")), o["public_id"][:8], o["product_name"],
+                  STATUS_FA.get(o["status"], o["status"]), o.get("fulfillment_error") or o.get("manual_reason") or ""]
+                 async for o in db.orders.find({"$or": [{"status": S.FAILED}, {"fulfillment_status": "MANUAL_PENDING"}]}).sort("updated_at", -1).limit(50)]
+    return render(request, admin, "page.html", title="خطاهای پرداخت و تحویل", forms=[], tables=[
+        {"title": "مشکل‌های پرداخت (عدم تطابق، پرداخت بدون سفارش، نیازمند بازپرداخت)", "columns": ["زمان", "شناسه پرداخت", "سفارش", "وضعیت", "مبلغ"], "rows": pay_err},
+        {"title": "مشکل‌های تحویل (ناموفق یا نیازمند تحویل دستی)", "columns": ["زمان", "سفارش", "محصول", "وضعیت", "علت / خطا"], "rows": deliv_err}])
 
 
 @router.post("/orders/{oid}/retry")
@@ -642,11 +707,17 @@ async def suppliers_page(request: Request, admin=Depends(auth.current_admin)):
     need_any(admin, "suppliers")
     db = get_db()
     sup = await telegram_supply.get_supply_status()
+    sender = stars_delivery.get_sender()
+    sender_line = "غیرفعال: روش رسمی ارسال Stars وجود ندارد؛ همه‌ی سفارش‌های Stars دستی‌اند"
+    if sender is not None:
+        ok, why = await sender.is_available()
+        sender_line = f"فعال ({sender.name})" if ok else f"{sender.name}: {why}"
     status_rows = [
         ["آخرین همگام‌سازی با تلگرام", str(sup.get("checked_at") or "—")[:19]],
         ["وضعیت", "موفق" if sup.get("ok") else f"خطا: {sup.get('error') or 'هنوز انجام نشده'}"],
         ["تعداد گیفت‌های موجود در تلگرام", sup.get("gifts_count") if sup.get("gifts_count") is not None else "—"],
         ["موجودی Stars ربات", sup.get("bot_balance") if sup.get("bot_balance") is not None else (sup.get("balance_error") or "—")],
+        ["ارسال خودکار Stars (از ≥ حداقل)", sender_line],
     ]
     errs = [[str(e.get("updated_at"))[:16], e["order_id"][:8], e.get("status", ""), e.get("send_state") or "", e.get("message", "")]
             async for e in db.supplier_orders.find({"$or": [{"status": "FAILED"}, {"send_state": "SENDING"}]}).sort("updated_at", -1).limit(30)]

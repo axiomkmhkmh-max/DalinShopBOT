@@ -135,3 +135,36 @@ async def tg(db, sent, fake_bot):
     await ts.sync_supply(fake_bot)
     await engine.refresh_all(None, fetch=False)
     return SimpleNamespace(gift=gift, prem=prem, stars=stars, bot=fake_bot, ts=ts)
+
+
+# ---------------------------------------------------------------- TEST-ONLY Stars sender (not shipped as a real sender)
+class FakeStarsSender:
+    """Stands in for a future official Stars sender. Records calls; sends nothing anywhere."""
+    name = "test-sender"
+
+    def __init__(self, balance=10_000):
+        self._balance = balance
+        self.available = True
+        self.sent: list = []
+        self.fail: Exception | None = None
+
+    async def is_available(self):
+        return (True, "") if self.available else (False, "offline")
+
+    async def balance(self):
+        return self._balance
+
+    async def send_stars(self, user_id, stars, idempotency_key):
+        if self.fail:
+            raise self.fail
+        self.sent.append((user_id, stars, idempotency_key))
+        self._balance -= stars
+
+
+@pytest.fixture
+def stars_sender():
+    import stars_delivery
+    s = FakeStarsSender()
+    stars_delivery.register_sender(s)
+    yield s
+    stars_delivery.register_sender(None)

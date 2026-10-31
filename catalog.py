@@ -34,7 +34,7 @@ async def get_product(public_id: str) -> dict | None:
     return await get_db().products.find_one({"public_id": public_id})
 
 
-DELIVERY_FA = {"auto_gift": "خودکار (گیفت تلگرام)", "auto_premium": "خودکار (Premium تلگرام)", "manual": "دستی"}
+DELIVERY_FA = {"stars_auto": "Stars: خودکار از ۵۰ به بالا اگر روش رسمی باشد، وگرنه دستی", "auto_gift": "خودکار (گیفت تلگرام)", "auto_premium": "خودکار (Premium تلگرام)", "manual": "دستی"}
 
 
 def delivery_spec(product: dict) -> dict:
@@ -49,7 +49,7 @@ async def purchasable(product: dict) -> tuple[bool, str, dict | None]:
         return False, "غیرفعال", None
     supplier_key = product.get("supplier_key") or "manual"
     sup = await get_db().suppliers.find_one({"key": supplier_key})
-    if supplier_key in ("manual", "telegram") and sup is None:
+    if supplier_key in ("manual", "telegram", "stars") and sup is None:
         pass  # built-in suppliers always exist
     elif sup is None or not sup.get("enabled"):
         return False, "تأمین‌کننده فعال نیست", None

@@ -37,6 +37,12 @@
   <select name="status"><option value="">همه وضعیت‌ها</option>
     {% for k, v in filters.statuses.items() %}<option value="{{ k }}" {{ 'selected' if k == filters.status else '' }}>{{ v }}</option>{% endfor %}
   </select>
+  {% if filters.pay_statuses %}<select name="pay"><option value="">همه وضعیت‌های پرداخت</option>
+    {% for k, v in filters.pay_statuses.items() %}<option value="{{ k }}" {{ 'selected' if k == filters.pay else '' }}>{{ v }}</option>{% endfor %}
+  </select>
+  <select name="deliv"><option value="">همه وضعیت‌های تحویل</option>
+    {% for k, v in filters.deliv_statuses.items() %}<option value="{{ k }}" {{ 'selected' if k == filters.deliv else '' }}>{{ v }}</option>{% endfor %}
+  </select>{% endif %}
   <input name="q" value="{{ filters.q }}" placeholder="شناسه سفارش یا کاربر">
   <button class="btn" type="submit">جستجو</button>
 </form>

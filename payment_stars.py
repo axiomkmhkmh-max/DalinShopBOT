@@ -10,23 +10,15 @@ Rules enforced here
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-
 from constants import OrderStatus as S
 from db import get_db
-from payment_base import PaymentInit, PaymentProvider
+from payment_base import PaymentInit, PaymentProvider, PaymentResult
 import notifier, orders
 import settings as st
 from util import as_aware, utcnow
 
 log = logging.getLogger(__name__)
 CURRENCY = "XTR"
-
-
-@dataclass
-class PaymentResult:
-    code: str            # OK | DUPLICATE | MISMATCH | UNKNOWN_ORDER | ORDER_CLOSED
-    order: dict | None = None
 
 
 class StarsProvider(PaymentProvider):
@@ -58,6 +50,8 @@ class StarsProvider(PaymentProvider):
             return False, "سفارش پیدا نشد."
         if order["user_id"] != user_id:
             return False, "این سفارش متعلق به شما نیست."
+        if order.get("payment_method") != "stars":
+            return False, "این سفارش با روش دیگری باید پرداخت شود."
         if order["status"] != S.PENDING_PAYMENT:
             return False, "این سفارش دیگر قابل پرداخت نیست."
         if as_aware(order["expires_at"]) <= utcnow():
@@ -89,6 +83,11 @@ class StarsProvider(PaymentProvider):
             await notifier.send_admins(
                 f"عدم تطابق پرداخت Stars: order={payload} expected={order.get('stars_amount')} got={total} {currency} charge={charge_id}")
             return PaymentResult("MISMATCH", order)
+
+        if order.get("payment_method") != "stars":      # money arrived for an order that expects another method
+            await db.payments.update_one({"_id": pay_id}, {"$setOnInsert": {**base, "status": "NEEDS_REFUND"}}, upsert=True)
+            await notifier.send_admins(f"پرداخت Stars برای سفارشی با روش پرداخت دیگر: order={payload} charge={charge_id} — نیاز به بازپرداخت")
+            return PaymentResult("ORDER_CLOSED", order)
 
         # idempotent payment record (unique _id = charge id)
         await db.payments.update_one({"_id": pay_id}, {"$setOnInsert": {**base, "status": "RECEIVED"}}, upsert=True)

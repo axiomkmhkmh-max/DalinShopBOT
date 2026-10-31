@@ -14,6 +14,7 @@ DEFAULTS: dict[str, str | None] = {
     "max_age_minutes": "120",               # automatic rates / Telegram data older than this stop sales
     "manual_rate_max_age_minutes": "1440",  # a rate typed by hand stops sales after this (default 24h)
     "order_ttl_minutes": "15",
+    "stars_auto_min": "50",                 # Stars orders >= this many Stars are delivered automatically IF a sender exists
     "auto_refresh_enabled": "true",         # scheduled refresh of rates + Telegram prices/availability
     "auto_delivery_enabled": "true",        # false => Premium/Gift orders wait for manual delivery
     "stars_usd_value": None,       # value of 1 Star in USD for CUSTOMER pricing (admin must set)
@@ -40,7 +41,7 @@ def _validate(key: str, value: str) -> str:
         if value not in ROUNDING_MODES:
             raise MoneyError("invalid rounding mode")
     elif key in ("rounding_step", "refresh_interval_minutes", "max_age_minutes", "manual_rate_max_age_minutes",
-                 "order_ttl_minutes"):
+                 "order_ttl_minutes", "stars_auto_min"):
         if not value.isdigit() or int(value) < 1:
             raise MoneyError(f"{key} must be a positive integer")
         if key == "refresh_interval_minutes" and int(value) < 5:

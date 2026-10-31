@@ -80,6 +80,9 @@ async def get_supplier(key: str | None) -> Supplier:
         return _override[key]
     if key == "manual":
         return ManualSupplier()
+    if key == "stars":
+        from stars_delivery import StarsSupplier   # lazy: avoids an import cycle
+        return StarsSupplier()
     if key == "telegram":
         from telegram_supply import TelegramSupplier   # lazy: avoids an import cycle
         return TelegramSupplier()

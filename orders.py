@@ -10,6 +10,7 @@ from constants import ALL_STATUSES, OrderStatus as S, can_transition, sources_fo
 from db import get_db
 import settings as st
 from catalog import delivery_spec, get_product, purchasable
+import stars_delivery
 from util import as_aware, new_id, utcnow
 
 
@@ -27,6 +28,10 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
     ok, reason, quote = await purchasable(product)
     if not ok:
         raise OrderError(reason)
+    try:
+        await stars_delivery.precheck(product, quantity)      # sender balance, BEFORE the customer pays
+    except stars_delivery.InsufficientSenderBalance as exc:
+        raise OrderError(str(exc))
     db = get_db()
     open_key = f"{user_id}:{product_id}:{quantity}:{payment_method}"
     now = utcnow()
@@ -62,6 +67,8 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
         "unit_price_toman": unit,
         "total_toman": total_toman,
         "stars_amount": stars_total,
+        "amount": stars_total if payment_method == "stars" else total_toman,       # what the customer pays...
+        "currency": "XTR" if payment_method == "stars" else "IRT",               # ...and in which unit
         "price_snapshot": {k: v for k, v in quote.items() if k != "_id"},
         "delivery_spec": delivery_spec(product),   # frozen: product edits never change a paid order
         "stock_reserved": reserved,

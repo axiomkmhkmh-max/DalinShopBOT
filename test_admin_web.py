@@ -54,7 +54,7 @@ async def test_pages_render(client):
 async def test_create_stars_product_defaults(client):
     await _post(client, "/products", "/products/new", **_form(name="500 Stars", amount="500"))
     p = await get_db().products.find_one({"name": "500 Stars"})
-    assert p["delivery"] == "manual" and p["supplier_key"] == "manual" and p["stock"] is None
+    assert p["delivery"] == "stars_auto" and p["supplier_key"] == "stars" and p["stock"] is None
     assert p["pricing"] == {"source": "manual", "manual_amount": "500", "manual_currency": "XTR"}
 
 
@@ -126,3 +126,33 @@ async def test_requires_login_and_csrf(tg):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         assert (await c.get("/products")).status_code == 303
         assert (await c.post("/products/new", data=_form())).status_code in (303, 403)
+
+
+async def test_order_filters_detail_and_errors_pages(client, tg, sent):
+    stars = get_provider("stars")
+    o = await orders.create_order(77, tg.stars, 1)
+    res = await stars.handle_successful_payment(77, o["public_id"], "XTR", o["stars_amount"], "cx")
+    await fulfillment.on_order_paid(res.order)
+    o2 = await orders.create_order(78, tg.stars, 1)                         # still unpaid
+    short, short2 = o["public_id"][:8], o2["public_id"][:8]
+    page = (await client.get("/orders?pay=PAID&deliv=MANUAL_PENDING")).text
+    assert short in page and short2 not in page
+    page = (await client.get("/orders?pay=UNPAID")).text
+    assert short2 in page and short not in page
+    detail = (await client.get(f"/orders/{o['public_id']}")).text
+    assert "cx" in detail and "XTR" in detail and "telegram payment verified" in detail
+    errors = (await client.get("/errors")).text
+    assert short in errors and "روش رسمی" in errors
+    assert "لاگ ممیزی" in (await client.get("/")).text and "/errors" in (await client.get("/")).text
+    assert (await client.get("/orders/nope", follow_redirects=True)).status_code == 200
+
+
+async def test_secrets_never_rendered_in_panel(client, tg, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "get_config", lambda: __import__("types").SimpleNamespace(
+        bot_token="999999:TOPSECRETTOKEN", rate_api_key="KEY-12345678", session_secret="S" * 40,
+        webhook_secret="W" * 20, admin_bootstrap_password="long-test-password", rate_api_url="", alert_ids=[]))
+    for path in ("/", "/pricing", "/suppliers", "/products", "/orders", "/errors"):
+        text = (await client.get(path)).text
+        for secret in ("TOPSECRETTOKEN", "KEY-12345678", "long-test-password"):
+            assert secret not in text

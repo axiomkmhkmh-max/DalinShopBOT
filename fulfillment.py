@@ -58,7 +58,10 @@ async def fulfill_order(order_id: str) -> str:
         return "DELIVERED"
 
     try:
-        supplier = await get_supplier(product.get("supplier_key"))
+        key = product.get("supplier_key")
+        if product.get("kind") == "stars" and key in (None, "manual", "stars"):
+            key = "stars"        # plain Stars: automatic from the minimum IF a real sender exists, else manual
+        supplier = await get_supplier(key)
         result = await supplier.place_order(
             SupplierRequest(order_id, product, order["quantity"], order["user_id"])
         )
@@ -79,7 +82,7 @@ async def fulfill_order(order_id: str) -> str:
         await _finish(order, text)
         return "DELIVERED"
     if status == "PENDING":
-        await db.orders.update_one({"public_id": order_id}, {"$set": {"fulfillment_status": "MANUAL_PENDING"}})
+        await db.orders.update_one({"public_id": order_id}, {"$set": {"fulfillment_status": "MANUAL_PENDING", "manual_reason": message}})
         await notifier.send_user(order["user_id"], MSG_PENDING.format(oid=oid_short))
         await notifier.send_admins(await _manual_alert(order, product, message))
         return "PENDING"
