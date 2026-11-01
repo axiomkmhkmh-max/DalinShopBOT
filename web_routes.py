@@ -15,7 +15,7 @@ from db import get_db
 from money import MoneyError, to_decimal, validate_profit
 from payment_manager import get_provider
 import background_hooks as hooks
-import catalog, fulfillment, orders, stars_delivery, telegram_supply, topups, wallet
+import catalog, fulfillment, orders, stars_delivery, stars_supplier, supplier_tracking, telegram_supply, topups, wallet
 import pricing_engine as engine
 import settings as st
 from audit import audit
@@ -34,7 +34,7 @@ NAV = [  # (label, path, permission)
     ("قیمت‌گذاری", "/pricing", "pricing_view"), ("سفارش‌ها", "/orders", "orders_view"),
     ("پرداخت‌ها", "/payments", "payments"), ("شارژ و تنظیمات کیف پول", "/topups", "payments"),
     ("کیف پول‌ها", "/wallets", "wallets_adjust"),
-    ("کاربران", "/users", "users"), ("تأمین و تحویل", "/suppliers", "suppliers"),
+    ("کاربران", "/users", "users"), ("تأمین و تحویل", "/suppliers", "suppliers"), ("تأمین Stars (API)", "/stars-supplier", "suppliers"),
     ("پشتیبانی", "/tickets", "support"), ("خطاها", "/errors", "orders_view"), ("لاگ ممیزی", "/audit", "audit"),
 ]
 
@@ -513,6 +513,7 @@ async def pricing_refresh(request: Request, admin=Depends(auth.current_admin), c
 MANUAL_FILTER = "MANUAL"
 PAY_STATUS_FA = {"UNPAID": "پرداخت‌نشده", "PAID": "پرداخت‌شده", "REFUNDED": "بازپرداخت‌شده"}
 DELIVERY_STATUS_FA = {"NONE": "شروع نشده", "PROCESSING": "در حال تحویل", "MANUAL_PENDING": "نیازمند تحویل دستی",
+                      "SUPPLIER_PENDING": "نزد تأمین‌کننده (در حال پیگیری)", "MANUAL_REVIEW": "بررسی دستی لازم است",
                       "DONE": "تحویل‌شده", "FAILED": "تحویل ناموفق"}
 METHOD_FA = {"stars": "Stars", "wallet": "کیف پول", "mock": "آزمایشی"}
 
@@ -523,7 +524,7 @@ async def orders_page(request: Request, status: str = "", q: str = "", pay: str 
     need_any(admin, "orders_view", "orders")
     flt: dict = {}
     if status == MANUAL_FILTER:
-        flt = {"status": S.PROCESSING, "fulfillment_status": "MANUAL_PENDING"}
+        flt = {"status": S.PROCESSING, "fulfillment_status": {"$in": ["MANUAL_PENDING", "MANUAL_REVIEW"]}}
     elif status in STATUS_FA:
         flt["status"] = status
     if pay in PAY_STATUS_FA:
@@ -559,7 +560,7 @@ async def orders_page(request: Request, status: str = "", q: str = "", pay: str 
                      DELIVERY_STATUS_FA.get(o.get("fulfillment_status"), o.get("fulfillment_status")),
                      STATUS_FA.get(o["status"], o["status"]),
                      o.get("fulfillment_error") or o.get("manual_reason") or "", str(o["created_at"])[:16], btns])
-    statuses = {**STATUS_FA, MANUAL_FILTER: "⚠ نیازمند تحویل دستی"}
+    statuses = {**STATUS_FA, MANUAL_FILTER: "⚠ نیازمند تحویل دستی / بررسی"}
     base = f"/orders?status={status}&q={q}&pay={pay}&deliv={deliv}"
     return render(request, admin, "page.html", title="سفارش‌ها", forms=[],
                   filters={"status": status, "q": q, "statuses": statuses, "pay": pay, "deliv": deliv,
@@ -590,6 +591,10 @@ async def order_detail_page(oid: str, request: Request, admin=Depends(auth.curre
             ["وضعیت تحویل", DELIVERY_STATUS_FA.get(o.get("fulfillment_status"), o.get("fulfillment_status"))],
             ["وضعیت سفارش", STATUS_FA.get(o["status"], o["status"])],
             ["نام فنی وضعیت", canonical_status(o)],
+            ["تأمین‌کننده: شناسه سفارش", sup.get("external_ref") or "—"],
+            ["تأمین‌کننده: وضعیت خودش", sup.get("supplier_status") or "—"],
+            ["پیگیری ما", sup.get("track_state") or "—"],
+            ["آخرین خطای تأمین‌کننده", sup.get("last_error") or "—"],
             ["حساب مقصد (Stars)", f"@{o['target_username']}" if o.get("target_username") else "—"],
             ["شناسه پیگیری تحویل", o.get("delivery_ref") or "—"],
             ["دلیل بازپرداخت", o.get("refund_reason") or "—"],
@@ -833,6 +838,81 @@ async def suppliers_page(request: Request, admin=Depends(auth.current_admin)):
     return render(request, admin, "page.html", title="تأمین و تحویل", forms=[], tables=[
         {"title": "وضعیت اتصال به تلگرام (تأمین‌کننده شما)", "columns": ["مورد", "مقدار"], "rows": status_rows},
         {"title": "خطاهای تحویل (SENDING = نتیجه ارسال نامشخص؛ دستی بررسی کنید)", "columns": ["زمان", "سفارش", "وضعیت", "ارسال", "پیام"], "rows": errs}])
+
+
+# ---------------- Stars supplier API (Stard) ----------------
+@router.get("/stars-supplier", response_class=HTMLResponse)
+async def stars_supplier_page(request: Request, qty: str = "", admin=Depends(auth.current_admin)):
+    need_any(admin, "suppliers")
+    db = get_db()
+    cfg = get_config()
+    ts = lambda v: str(v)[:16] if v else "—"
+    status_rows = [
+        ["سرویس", f"فعال ({cfg.stars_supplier_provider})" if stars_supplier.is_enabled() else "غیرفعال (STARS_SUPPLIER_ENABLED و STARS_SUPPLIER_API_KEY لازم است)"],
+        ["کلید API", "در متغیر محیطی تنظیم شده" if cfg.stars_supplier_api_key else "تنظیم نشده"],
+        ["محیط کلید", ("آزمایشی (sk_test_)" if cfg.stars_supplier_api_key.startswith("sk_test_") else "واقعی (sk_live_)") if cfg.stars_supplier_api_key else "—"],
+        ["فاصله پیگیری / حداکثر تلاش / مهلت گیرکردن", f"{cfg.stars_supplier_poll_interval} ثانیه / {cfg.stars_supplier_max_retries} / {cfg.stars_supplier_stuck_minutes} دقیقه"],
+    ]
+    for state, label in supplier_tracking.TRACK_FA.items():
+        status_rows.append([f"سفارش‌ها: {label}", await db.supplier_orders.count_documents({"track_state": state})])
+    if qty.isdigit() and stars_supplier.is_enabled():
+        try:
+            q = await stars_supplier.get_adapter().quote(int(qty))
+            status_rows.append([f"قیمت تأمین‌کننده برای {int(qty):,} Stars", f"{q.amount_toman:,} تومان"])
+        except Exception as exc:
+            status_rows.append([f"قیمت تأمین‌کننده برای {qty} Stars", f"خطا: {type(exc).__name__}"])
+    rows = []
+    async for r in db.supplier_orders.find({"track_state": {"$exists": True}}).sort("updated_at", -1).limit(100):
+        btns = []
+        if r["track_state"] in (supplier_tracking.TO_SUBMIT, supplier_tracking.SUBMITTED, supplier_tracking.MANUAL_REVIEW):
+            btns.append({"form": {"action": f"/stars-supplier/{r['order_id']}/poll", "label": "بررسی مجدد اکنون", "confirm": ""}})
+        if r["track_state"] == supplier_tracking.MANUAL_REVIEW and not r.get("external_ref"):
+            btns.append({"form": {"action": f"/stars-supplier/{r['order_id']}/retry", "label": "ارسال مجدد (همان شناسه یکتا)",
+                                  "confirm": "با همان شناسه یکتا دوباره ارسال می‌شود؛ سفارش تکراری ساخته نمی‌شود. ادامه؟"}})
+        rows.append([r["order_id"][:8], supplier_tracking.TRACK_FA.get(r["track_state"], r["track_state"]), r.get("external_ref") or "—",
+                     r.get("supplier_status") or "—", r.get("track_total_stars"), f"@{r.get('track_recipient')}" if r.get("track_recipient") else "—",
+                     r.get("fail_count", 0), r.get("poll_count", 0), r.get("last_error") or "", ts(r.get("next_poll_at")) if r["track_state"] != supplier_tracking.CLOSED and (r.get("next_poll_at") and r["next_poll_at"].year < 2100) else "—", btns])
+    forms = [{"action": "/stars-supplier", "method": "get", "title": "قیمت تأمین‌کننده برای تعداد Stars", "submit": "نمایش",
+              "fields": [form_field("qty", "تعداد Stars", qty)]},
+             {"action": "/stars-supplier/ping", "title": "بررسی اتصال و موجودی کیف پول تأمین‌کننده", "submit": "بررسی", "fields": []}]
+    return render(request, admin, "page.html", title="تأمین Stars با API", forms=forms, tables=[
+        {"title": "وضعیت", "columns": ["مورد", "مقدار"], "rows": status_rows},
+        {"title": "سفارش‌های Stars نزد تأمین‌کننده (آخرین ۱۰۰)", "columns": ["سفارش", "پیگیری ما", "شناسه تأمین‌کننده", "وضعیت خودِ تأمین‌کننده", "Stars", "مقصد", "خطاهای پیاپی", "تعداد پیگیری", "آخرین خطا", "پیگیری بعدی", "عملیات"], "rows": rows}])
+
+
+@router.post("/stars-supplier/ping")
+async def stars_supplier_ping(request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "suppliers")
+    if not stars_supplier.is_enabled():
+        return back(request, "/stars-supplier", "تأمین‌کننده فعال نیست.")
+    try:
+        adapter = stars_supplier.get_adapter()
+        ping = await adapter.ping()
+        bal = await adapter.balance()
+        msg = f"اتصال {'برقرار' if ping.get('ok') else 'ناموفق'} | محیط: {ping.get('environment') or '—'} | موجودی کیف پول تأمین‌کننده: {bal if bal is not None else '—'}"
+    except Exception as exc:
+        msg = f"خطا: {type(exc).__name__} {getattr(exc, 'code', '')}"
+    await audit(admin["username"], "supplier_ping", "stars-supplier")
+    return back(request, "/stars-supplier", msg)
+
+
+@router.post("/stars-supplier/{oid}/poll")
+async def stars_supplier_poll(oid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "orders")
+    result = await supplier_tracking.poll_now(oid)
+    await audit(admin["username"], "supplier_poll", oid, {"result": result})
+    return back(request, "/stars-supplier", f"نتیجه: {result}")
+
+
+@router.post("/stars-supplier/{oid}/retry")
+async def stars_supplier_retry(oid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "orders")
+    ok = await supplier_tracking.retry_submit(oid)
+    await audit(admin["username"], "supplier_retry", oid, {"ok": ok})
+    return back(request, "/stars-supplier", "به صف ارسال برگشت." if ok else "این سفارش قابل ارسال مجدد نیست.")
 
 
 @router.get("/tickets", response_class=HTMLResponse)

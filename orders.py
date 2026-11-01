@@ -62,6 +62,15 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
         ok, reason, quote = await purchasable(product)
         if not ok:
             raise OrderError(reason)
+    if custom:
+        _tot = int(quote["final_toman"])
+    else:
+        _tot = int(quote["final_toman"]) * quantity
+    if product.get("kind") == "stars":
+        import supplier_tracking                              # lazy: supplier_tracking imports orders
+        problem = await supplier_tracking.guard_new_order(stars_delivery.stars_total(product, quantity), _tot)
+        if problem:
+            raise OrderError(problem)
     try:
         await stars_delivery.precheck(product, quantity)      # sender balance, BEFORE the customer pays
     except stars_delivery.InsufficientSenderBalance as exc:

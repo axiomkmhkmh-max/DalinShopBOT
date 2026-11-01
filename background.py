@@ -10,7 +10,7 @@ from pymongo.errors import DuplicateKeyError
 from config import get_config
 from constants import OrderStatus as S
 from db import get_db
-import fulfillment, notifier, orders, payment_wallet, telegram_supply, topups, wallet
+import fulfillment, notifier, orders, payment_wallet, supplier_tracking, telegram_supply, topups, wallet
 import settings as st
 import pricing_engine as engine
 from pricing_providers import build_rate_provider
@@ -68,6 +68,11 @@ async def run_order_maintenance() -> None:
     # Claimed for delivery but no outcome was ever recorded (crash / restart): flag once for the admin.
     stuck = utcnow() - timedelta(minutes=10)
     async for o in db.orders.find({"status": S.PROCESSING, "fulfillment_status": "PROCESSING", "updated_at": {"$lt": stuck}}):
+        tracked = await db.supplier_orders.find_one({"order_id": o["public_id"], "track_state": {"$exists": True}})
+        if tracked:        # a supplier worker owns it: it is not lost, just waiting for the worker
+            await db.orders.update_one({"public_id": o["public_id"], "fulfillment_status": "PROCESSING"},
+                                       {"$set": {"fulfillment_status": "SUPPLIER_PENDING"}})
+            continue
         res = await db.orders.update_one({"public_id": o["public_id"], "fulfillment_status": "PROCESSING"},
                                          {"$set": {"fulfillment_status": "MANUAL_PENDING"}})
         if res.modified_count == 1:
@@ -88,7 +93,12 @@ async def loop(name: str, coro_factory, every: int) -> None:
 
 
 def start_all() -> list[asyncio.Task]:
-    return [
+    tasks = [
         asyncio.create_task(loop("pricing", run_pricing_cycle, 60)),
         asyncio.create_task(loop("orders", run_order_maintenance, 60)),
     ]
+    cfg = get_config()
+    if cfg.stars_supplier_enabled and cfg.stars_supplier_api_key:        # supplier worker: its own, configurable interval
+        tasks.append(asyncio.create_task(loop("stars_supplier", supplier_tracking.run_poll_cycle,
+                                              max(5, int(cfg.stars_supplier_poll_interval)))))
+    return tasks

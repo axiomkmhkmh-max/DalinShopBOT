@@ -72,6 +72,10 @@ def canonical_status(order: dict) -> str:
     st = order.get("status")
     if st == S.PROCESSING and order.get("fulfillment_status") == "MANUAL_PENDING":
         return "pending_manual_delivery"
+    if st == S.PROCESSING and order.get("fulfillment_status") == "SUPPLIER_PENDING":
+        return "supplier_pending"
+    if st == S.PROCESSING and order.get("fulfillment_status") == "MANUAL_REVIEW":
+        return "manual_review"
     return {
         S.PENDING_PAYMENT: "awaiting_payment", S.PAID: "paid", S.PROCESSING: "processing", S.FULFILLED: "delivered",
         S.FAILED: "failed", S.CANCELLED: "cancelled", S.REFUND_PENDING: "refund_pending", S.REFUNDED: "refunded",

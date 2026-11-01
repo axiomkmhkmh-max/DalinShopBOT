@@ -48,6 +48,16 @@ class Config(BaseSettings):
     auto_stars_delivery: bool = True           # AUTO_STARS_DELIVERY=false => never use an automatic sender (none exists today)
     zarinpal_callback_base_url: str = ""       # optional public URL for Zarinpal's return page (ngrok / Railway); default PUBLIC_BASE_URL
 
+    # ---- Stars supplier (API that really delivers Telegram Stars). Key ONLY from the environment. ----
+    stars_supplier_enabled: bool = False        # STARS_SUPPLIER_ENABLED
+    stars_supplier_provider: str = "stard"      # STARS_SUPPLIER_PROVIDER (only "stard" exists today)
+    stars_supplier_api_base: str = "https://stard-market.ir/api/v1"   # STARS_SUPPLIER_API_BASE
+    stars_supplier_api_key: str = ""            # STARS_SUPPLIER_API_KEY  (sk_test_... first, sk_live_... later)
+    stars_supplier_timeout: float = 20.0        # STARS_SUPPLIER_TIMEOUT seconds per request
+    stars_supplier_poll_interval: int = 20      # STARS_SUPPLIER_POLL_INTERVAL seconds between status checks
+    stars_supplier_max_retries: int = 4         # STARS_SUPPLIER_MAX_RETRIES failed attempts before manual review
+    stars_supplier_stuck_minutes: int = 120     # STARS_SUPPLIER_STUCK_MINUTES not finished after this long -> manual review
+
     enable_mock_payment: bool = False   # local development only; ignored in production
 
     @property

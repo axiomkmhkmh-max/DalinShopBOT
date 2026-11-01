@@ -60,14 +60,19 @@ async def fulfill_order(order_id: str) -> str:
     try:
         key = product.get("supplier_key")
         if product.get("kind") == "stars" and key in (None, "manual", "stars"):
-            key = "stars"        # plain Stars: automatic from the minimum IF a real sender exists, else manual
+            import stars_supplier
+            # plain Stars: through the supplier API when configured (tracked by supplier_tracking), else a registered
+            # official sender when one exists, else manual delivery
+            key = "stars_supplier" if stars_supplier.is_enabled() else "stars"
         supplier = await get_supplier(key)
         result = await supplier.place_order(
             SupplierRequest(order_id, product, order["quantity"], order["user_id"], order.get("target_username"))
         )
         status, message, ext, text = result.status, result.message, result.external_ref, result.delivery_text
+        refund_now = bool(result.refund)
     except Exception as exc:
         status, message, ext, text = "FAILED", redact(f"{type(exc).__name__}: {exc}"), "", ""
+        refund_now = False
 
     await db.supplier_orders.update_one(
         {"order_id": order_id},
@@ -86,22 +91,60 @@ async def fulfill_order(order_id: str) -> str:
         await notifier.send_user(order["user_id"], MSG_PENDING.format(oid=oid_short))
         await notifier.send_admins(await _manual_alert(order, product, message))
         return "PENDING"
-    await orders.transition(order_id, S.FAILED, from_states=[S.PROCESSING],
-                            set_fields={"fulfillment_status": "FAILED", "fulfillment_error": message}, note=message)
-    if await _maybe_auto_refund(order_id):
-        await notifier.send_user(order["user_id"], f"تحویل سفارش {oid_short} ممکن نشد و مبلغ آن به کیف پول شما برگشت.")
-        await notifier.send_admins(f"سفارش {order_id} ناموفق بود و به کیف پول بازپرداخت شد: {message}")
-        return "FAILED"
-    await notifier.send_user(order["user_id"], MSG_FAILED.format(oid=oid_short))     # no new charge asked
-    await notifier.send_admins(f"تحویل سفارش {order_id} ناموفق بود: {message}")
+    if status == "SUPPLIER_PENDING":
+        # the supplier has (or will get, replay-safely) the order; supplier_tracking follows it. NOT a failure, NOT manual.
+        await db.orders.update_one({"public_id": order_id, "status": S.PROCESSING},
+                                   {"$set": {"fulfillment_status": "SUPPLIER_PENDING", "manual_reason": ""}})
+        await notifier.send_user(order["user_id"], MSG_PENDING.format(oid=oid_short))
+        return "SUPPLIER_PENDING"
+    if status == "MANUAL_REVIEW":
+        await mark_manual_review(order_id, message)
+        await notifier.send_user(order["user_id"], MSG_PENDING.format(oid=oid_short))
+        return "MANUAL_REVIEW"
+    await finish_failed(order_id, message, refund=refund_now)
     return "FAILED"
 
 
-async def _maybe_auto_refund(order_id: str) -> bool:
-    """Opt-in (setting wallet_auto_refund_on_fail). Only for wallet-paid orders whose delivery DEFINITELY failed with
-    nothing sent (no delivered unit, no send in flight). Unknown outcomes never reach here (they stay for the admin)."""
+async def finish_failed(order_id: str, message: str, *, refund: bool = False) -> None:
+    """Definite failure of the delivery step. `refund=True` (the supplier DEFINITELY did nothing) refunds a wallet-paid
+    order automatically, once; otherwise the opt-in setting wallet_auto_refund_on_fail decides; else the admin decides."""
     order = await orders.get_order(order_id)
-    if not order or order.get("payment_method") != "wallet" or not await st.get_bool("wallet_auto_refund_on_fail"):
+    if not order:
+        return
+    oid_short = order_id[:8]
+    await orders.transition(order_id, S.FAILED, from_states=[S.PROCESSING],
+                            set_fields={"fulfillment_status": "FAILED", "fulfillment_error": message}, note=message)
+    if await _maybe_auto_refund(order_id, force=refund):
+        await notifier.send_user(order["user_id"], f"تحویل سفارش {oid_short} ممکن نشد و مبلغ آن به کیف پول شما برگشت.")
+        await notifier.send_admins(f"سفارش {order_id} ناموفق بود و به کیف پول بازپرداخت شد: {message}")
+        return
+    await notifier.send_user(order["user_id"], MSG_FAILED.format(oid=oid_short))     # no new charge asked
+    await notifier.send_admins(f"تحویل سفارش {order_id} ناموفق بود: {message}")
+
+
+async def mark_manual_review(order_id: str, reason: str) -> None:
+    """A human must look. No refund, no new send. Alerts the admins once."""
+    order = await orders.get_order(order_id)
+    res = await get_db().orders.update_one(
+        {"public_id": order_id, "status": S.PROCESSING, "fulfillment_status": {"$ne": "MANUAL_REVIEW"}},
+        {"$set": {"fulfillment_status": "MANUAL_REVIEW", "manual_reason": reason[:300]}})
+    if res.modified_count == 1 and order:
+        sup = await get_db().supplier_orders.find_one({"order_id": order_id}) or {}
+        target = f"\nحساب مقصد: @{order['target_username']}" if order.get("target_username") else ""
+        await notifier.send_admins(
+            f"🔎 سفارش {order_id} نیاز به بررسی دستی دارد.{target}\nعلت: {reason}\n"
+            f"شناسه تأمین‌کننده: {sup.get('external_ref') or '—'} | وضعیت تأمین‌کننده: {sup.get('supplier_status') or '—'}\n"
+            "قبل از بازپرداخت یا تحویل دستی، وضعیت را در پنل «تأمین Stars» بررسی کنید.")
+
+
+async def _maybe_auto_refund(order_id: str, force: bool = False) -> bool:
+    """Wallet-paid orders whose delivery DEFINITELY failed with nothing sent (no delivered unit, no send in flight).
+    `force` = the supplier gave a definite answer; otherwise the opt-in setting wallet_auto_refund_on_fail decides.
+    Unknown outcomes never reach here (they stay for the admin)."""
+    order = await orders.get_order(order_id)
+    if not order or order.get("payment_method") != "wallet":
+        return False
+    if not force and not await st.get_bool("wallet_auto_refund_on_fail"):
         return False
     sup = await get_db().supplier_orders.find_one({"order_id": order_id}) or {}
     if int(sup.get("units_done") or 0) > 0 or sup.get("send_state") == "SENDING":

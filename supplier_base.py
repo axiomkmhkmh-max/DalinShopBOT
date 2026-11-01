@@ -1,6 +1,7 @@
 """Supplier abstraction.
 
   manual   -> you deliver by hand from the dashboard (used for Telegram Stars)
+  stars_supplier -> a Stars supplier API delivers; tracked by supplier_tracking.py (STARS_SUPPLIER_* env)
   telegram -> the bot delivers Gifts / Premium through the official Bot API (telegram_supply.py)
   mock     -> tests / local development only
 """
@@ -32,6 +33,7 @@ class SupplierResult:
     message: str = ""
     external_ref: str = ""
     delivery_text: str = ""     # optional text shown to the customer (e.g. a code)
+    refund: bool = False        # FAILED only: the failure is DEFINITE (nothing delivered/created) -> refund a wallet-paid order
 
 
 class Supplier(ABC):
@@ -81,6 +83,9 @@ async def get_supplier(key: str | None) -> Supplier:
         return _override[key]
     if key == "manual":
         return ManualSupplier()
+    if key == "stars_supplier":
+        from supplier_tracking import StarsSupplierProvider   # lazy: avoids an import cycle
+        return StarsSupplierProvider()
     if key == "stars":
         from stars_delivery import StarsSupplier   # lazy: avoids an import cycle
         return StarsSupplier()

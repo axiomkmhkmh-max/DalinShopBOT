@@ -36,7 +36,7 @@ def redact(text) -> str:
     out = str(text)
     cfg = get_config()
     for secret in (cfg.bot_token, cfg.rate_api_key, cfg.session_secret, cfg.webhook_secret,
-                   cfg.admin_bootstrap_password, cfg.zarinpal_merchant_id):
+                   cfg.admin_bootstrap_password, cfg.zarinpal_merchant_id, cfg.stars_supplier_api_key):
         if secret and len(secret) >= 6:
             out = out.replace(secret, "***")
     return out
