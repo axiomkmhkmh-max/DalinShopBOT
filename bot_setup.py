@@ -2,7 +2,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 
-import handler_account as account, handler_payments as payments, handler_shop as shop, handler_start as start, handler_support as support
+import handler_wallet as wallet_h, handler_account as account, handler_payments as payments, handler_shop as shop, handler_start as start, handler_support as support
 from middlewares import UserMiddleware
 
 
@@ -18,6 +18,7 @@ def build_dispatcher() -> Dispatcher:
     # pre_checkout_query must be answered fast and does not need the user middleware DB write,
     # but registering the user there is harmless; we intentionally do NOT attach it.
     dp.include_router(start.router)
+    dp.include_router(wallet_h.router)      # first: its FSM (custom top-up amount) must win over menu handlers
     dp.include_router(payments.router)
     dp.include_router(shop.router)
     dp.include_router(account.router)

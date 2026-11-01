@@ -146,6 +146,7 @@ class FakeStarsSender:
         self._balance = balance
         self.available = True
         self.sent: list = []
+        self.targets: list = []
         self.fail: Exception | None = None
 
     async def is_available(self):
@@ -154,10 +155,11 @@ class FakeStarsSender:
     async def balance(self):
         return self._balance
 
-    async def send_stars(self, user_id, stars, idempotency_key):
+    async def send_stars(self, user_id, stars, idempotency_key, *, target_username=None):
         if self.fail:
             raise self.fail
         self.sent.append((user_id, stars, idempotency_key))
+        self.targets.append(target_username)
         self._balance -= stars
 
 

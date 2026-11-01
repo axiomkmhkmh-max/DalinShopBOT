@@ -9,6 +9,9 @@ MENU_INVITE = "👥 دعوت دوستان"
 MENU_SUPPORT = "🎧 پشتیبانی"
 MENU_ACCOUNT = "👤 حساب کاربری"
 
+ALL_MENU_BUTTONS = {MENU_SHOP, MENU_PREMIUM, MENU_STARS, MENU_GIFTS, MENU_WALLET, MENU_ORDERS, MENU_DISCOUNT,
+                    MENU_INVITE, MENU_SUPPORT, MENU_ACCOUNT}
+
 WELCOME = "به فروشگاه خوش آمدید. یکی از گزینه‌های منو را انتخاب کنید."
 HELP = "برای خرید از منوی پایین استفاده کنید. در صورت مشکل از بخش پشتیبانی پیام بدهید."
 BACK = "⬅️ بازگشت"
@@ -19,6 +22,10 @@ PAY_STARS = "⭐ پرداخت با Telegram Stars"
 PAY_WALLET = "👛 پرداخت از کیف پول"
 PAY_MOCK = "🧪 پرداخت آزمایشی"
 CANCEL = "انصراف"
+ASK_TARGET = ("یوزرنیم تلگرام حساب مقصد (کسی که Stars را دریافت می‌کند) را بفرستید، مثلاً @username.\n"
+              "⚠️ هرگز رمز عبور، کد ورود یا رمز دومرحله‌ای تلگرام را نفرستید؛ فقط یوزرنیم عمومی لازم است.\n"
+              "برای انصراف: /cancel")
+PAY_WALLET_CONFIRM = "✅ پرداخت از کیف پول"
 DELIVERY_AUTO = "⚡ تحویل خودکار، بلافاصله بعد از پرداخت (برای همین حساب شما)"
 DELIVERY_MANUAL = "🕒 تحویل دستی؛ بعد از پرداخت توسط پشتیبانی انجام می‌شود"
 

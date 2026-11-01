@@ -10,7 +10,7 @@ from pymongo.errors import DuplicateKeyError
 from config import get_config
 from constants import OrderStatus as S
 from db import get_db
-import fulfillment, notifier, orders, telegram_supply
+import fulfillment, notifier, orders, payment_wallet, telegram_supply, topups, wallet
 import settings as st
 import pricing_engine as engine
 from pricing_providers import build_rate_provider
@@ -58,6 +58,9 @@ async def run_pricing_cycle(force: bool = False) -> dict | None:
 
 async def run_order_maintenance() -> None:
     await orders.expire_pending_orders()
+    await wallet.recover_pending()            # interrupted wallet operations
+    await payment_wallet.recover_orphan_debits()   # debited but order closed unpaid -> give back once
+    await topups.reconcile_pending()      # paid-but-never-returned Zarinpal top-ups; no-op when none are pending
     db = get_db()
     cutoff = utcnow() - timedelta(minutes=2)
     async for o in db.orders.find({"status": S.PAID, "paid_at": {"$lt": cutoff}}):

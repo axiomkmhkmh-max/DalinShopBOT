@@ -34,6 +34,20 @@ class Config(BaseSettings):
     rate_json_path: str = ""
     rate_unit: str = "IRT"
 
+    # Zarinpal wallet top-up (OFF by default; also needs the dashboard switch). Secrets only via environment.
+    zarinpal_merchant_id: str = ""
+    zarinpal_sandbox: bool = False       # sandbox.zarinpal.com; refused when APP_ENV=production
+
+    # ---- personal-test switches (all optional; an unset ENV leaves the dashboard setting in charge) ----
+    testing_mode: bool = False                 # TESTING_MODE=true: purchases/payments only for TESTER_USER_IDS
+    tester_user_ids: str = ""                  # TESTER_USER_IDS=123456789,987654321 (numeric Telegram IDs)
+    zarinpal_enabled: bool | None = None       # ZARINPAL_ENABLED     -> overrides setting zarinpal_topup_enabled
+    wallet_payments_enabled: bool | None = None  # WALLET_PAYMENTS_ENABLED -> overrides setting wallet_payment_enabled
+    custom_stars_enabled: bool | None = None   # CUSTOM_STARS_ENABLED -> overrides setting custom_stars_enabled
+    manual_stars_delivery: bool = True         # MANUAL_STARS_DELIVERY=false => Stars cannot be ordered unless an auto sender exists
+    auto_stars_delivery: bool = True           # AUTO_STARS_DELIVERY=false => never use an automatic sender (none exists today)
+    zarinpal_callback_base_url: str = ""       # optional public URL for Zarinpal's return page (ngrok / Railway); default PUBLIC_BASE_URL
+
     enable_mock_payment: bool = False   # local development only; ignored in production
 
     @property

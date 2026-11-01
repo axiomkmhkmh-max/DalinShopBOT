@@ -63,7 +63,7 @@ async def fulfill_order(order_id: str) -> str:
             key = "stars"        # plain Stars: automatic from the minimum IF a real sender exists, else manual
         supplier = await get_supplier(key)
         result = await supplier.place_order(
-            SupplierRequest(order_id, product, order["quantity"], order["user_id"])
+            SupplierRequest(order_id, product, order["quantity"], order["user_id"], order.get("target_username"))
         )
         status, message, ext, text = result.status, result.message, result.external_ref, result.delivery_text
     except Exception as exc:
@@ -88,9 +88,26 @@ async def fulfill_order(order_id: str) -> str:
         return "PENDING"
     await orders.transition(order_id, S.FAILED, from_states=[S.PROCESSING],
                             set_fields={"fulfillment_status": "FAILED", "fulfillment_error": message}, note=message)
+    if await _maybe_auto_refund(order_id):
+        await notifier.send_user(order["user_id"], f"تحویل سفارش {oid_short} ممکن نشد و مبلغ آن به کیف پول شما برگشت.")
+        await notifier.send_admins(f"سفارش {order_id} ناموفق بود و به کیف پول بازپرداخت شد: {message}")
+        return "FAILED"
     await notifier.send_user(order["user_id"], MSG_FAILED.format(oid=oid_short))     # no new charge asked
     await notifier.send_admins(f"تحویل سفارش {order_id} ناموفق بود: {message}")
     return "FAILED"
+
+
+async def _maybe_auto_refund(order_id: str) -> bool:
+    """Opt-in (setting wallet_auto_refund_on_fail). Only for wallet-paid orders whose delivery DEFINITELY failed with
+    nothing sent (no delivered unit, no send in flight). Unknown outcomes never reach here (they stay for the admin)."""
+    order = await orders.get_order(order_id)
+    if not order or order.get("payment_method") != "wallet" or not await st.get_bool("wallet_auto_refund_on_fail"):
+        return False
+    sup = await get_db().supplier_orders.find_one({"order_id": order_id}) or {}
+    if int(sup.get("units_done") or 0) > 0 or sup.get("send_state") == "SENDING":
+        return False
+    from payment_wallet import WalletProvider
+    return await WalletProvider().refund(order, actor="system", reason="تحویل ناموفق؛ بازپرداخت خودکار به کیف پول")
 
 
 async def _manual_alert(order: dict, product: dict, message: str) -> str:
@@ -100,7 +117,10 @@ async def _manual_alert(order: dict, product: dict, message: str) -> str:
     what = product.get("name") or order.get("product_name")
     amount = f" ({product['amount']})" if product.get("amount") else ""
     text = (f"🔔 تحویل دستی لازم است\nسفارش: {order['public_id']}\nمحصول: {what}{amount} × {order['quantity']}\n"
-            f"گیرنده: {who}{order['user_id']}\n(پنل ادمین > سفارش‌ها > «تحویل شد»)")
+            f"خریدار: {who}{order['user_id']}\n")
+    if order.get("target_username"):
+        text += f"حساب مقصد Stars: @{order['target_username']}\n"
+    text += "(پنل ادمین > سفارش‌ها > «تحویل شد» + شناسه پیگیری)"
     if message and message != "manual fulfillment required":
         text += f"\nعلت: {message}"
     return text
@@ -119,15 +139,20 @@ async def _finish(order: dict, delivery_text: str) -> None:
 
 
 async def complete_manual(order_id: str, actor: str, delivery_text: str = "") -> bool:
-    """Admin confirms a manual delivery."""
+    """Admin confirms a manual delivery. The text typed by the admin is stored as the delivery tracking reference
+    (visible in the dashboard) and is also shown to the customer."""
     db = get_db()
     order = await orders.get_order(order_id)
     if not order or order["status"] != S.PROCESSING:
         return False
+    ref = (delivery_text or "").strip()[:200]
     await db.supplier_orders.update_one(
         {"order_id": order_id},
-        {"$set": {"status": "DELIVERED", "send_state": "IDLE", "updated_at": utcnow(), "delivered_by": actor}},
+        {"$set": {"status": "DELIVERED", "send_state": "IDLE", "updated_at": utcnow(), "delivered_by": actor,
+                  **({"external_ref": ref} if ref else {})}},
         upsert=True)
+    if ref:
+        await db.orders.update_one({"public_id": order_id}, {"$set": {"delivery_ref": ref}})
     await _finish(order, delivery_text)
     return True
 

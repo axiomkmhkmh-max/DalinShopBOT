@@ -22,7 +22,7 @@ async def list_categories() -> list[dict]:
 
 
 async def list_products(category_id: str | None = None, kind: str | None = None) -> list[dict]:
-    q: dict = {"enabled": True}
+    q: dict = {"enabled": True, "hidden": {"$ne": True}}
     if category_id:
         q["category_id"] = category_id
     if kind:
@@ -89,6 +89,21 @@ async def save_product(data: dict, public_id: str | None = None) -> str:
     pid = new_id()
     await db.products.insert_one({"public_id": pid, "created_at": now, "updated_at": now, "sort": 100, **data})
     return pid
+
+
+CUSTOM_STARS_ID = "custom_stars"
+
+
+async def ensure_custom_stars_product() -> dict:
+    """Hidden helper product that carries 'N Stars typed by the customer' (priced per order, see pricing_engine)."""
+    db = get_db()
+    now = utcnow()
+    await db.products.update_one({"public_id": CUSTOM_STARS_ID}, {"$setOnInsert": {
+        "public_id": CUSTOM_STARS_ID, "name": "Telegram Stars (تعداد دلخواه)", "description": "", "kind": "stars",
+        "enabled": True, "hidden": True, "custom_amount": True, "delivery": "stars_auto", "amount": 1, "gift_id": None,
+        "supplier_key": "stars", "stock": None, "pricing": {"source": "custom"}, "digital_in_telegram": True,
+        "sort": 1000, "created_at": now, "updated_at": now}}, upsert=True)
+    return await db.products.find_one({"public_id": CUSTOM_STARS_ID})
 
 
 async def save_category(name: str, public_id: str | None = None, enabled: bool = True) -> str:

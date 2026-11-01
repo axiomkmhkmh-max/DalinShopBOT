@@ -23,6 +23,7 @@ class SupplierRequest:
     product: dict
     quantity: int
     user_id: int
+    target_username: str | None = None   # Stars: destination @username (without @)
 
 
 @dataclass

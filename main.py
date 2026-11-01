@@ -16,8 +16,9 @@ from bot_setup import build_bot, build_dispatcher
 from config import get_config
 from db import close_db, get_db, init_db
 import notifier
-import auth
+import access, auth
 from web_routes import router
+from web_pay import router as pay_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -27,6 +28,7 @@ cfg = get_config()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db(cfg.mongodb_uri, cfg.mongodb_db)
+    access.startup_report()
     await auth.bootstrap_owner(cfg.admin_bootstrap_username, cfg.admin_bootstrap_password)
     tasks: list[asyncio.Task] = []
     app.state.bot = None
@@ -108,4 +110,5 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     return {"ok": True}
 
 
+app.include_router(pay_router)      # public Zarinpal return page (re-verifies on the server)
 app.include_router(router)

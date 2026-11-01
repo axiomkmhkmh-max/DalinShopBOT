@@ -45,6 +45,9 @@ async def ensure_indexes(db) -> None:
     await db.wallets.create_index("user_id", unique=True)
     await db.wallet_ledger.create_index("idem_key", unique=True)    # duplicate-transaction protection
     await db.wallet_ledger.create_index([("user_id", 1), ("created_at", -1)])
+    await db.topups.create_index("public_id", unique=True)
+    await db.topups.create_index([("user_id", 1), ("created_at", -1)])
+    await db.topups.create_index([("status", 1), ("created_at", 1)])
     await db.supplier_orders.create_index("order_id", unique=True)  # duplicate-fulfillment protection
     await db.suppliers.create_index("key", unique=True)
     await db.tickets.create_index([("user_id", 1), ("created_at", -1)])

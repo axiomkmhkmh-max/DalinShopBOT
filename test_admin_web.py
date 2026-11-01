@@ -115,7 +115,7 @@ async def test_refund_button(client, tg, sent):
     o = await orders.create_order(43, tg.stars, 1)
     res = await stars.handle_successful_payment(43, o["public_id"], "XTR", o["stars_amount"], "c2")
     await fulfillment.on_order_paid(res.order)
-    await _post(client, "/orders", f"/orders/{o['public_id']}/refund")
+    await _post(client, "/orders", f"/orders/{o['public_id']}/refund", reason="test refund")
     assert (await orders.get_order(o["public_id"]))["status"] == S.REFUNDED and tg.bot.refunds
 
 

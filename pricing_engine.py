@@ -186,12 +186,42 @@ async def recompute_product(product: dict) -> None:
         await _mark_quote_error(product["public_id"], str(exc))
 
 
+async def custom_stars_quote(stars: int) -> dict:
+    """Price for a customer-typed number of Stars. Same formula as the packages (cost + profit, rounded, profit never
+    above the 7000 Toman cap, Stars the customer really pays kept inside the cap). Nothing is stored: the order freezes it.
+    Raises PriceUnavailable when any input (USD rate, Star cost, Star value) is missing or stale."""
+    if isinstance(stars, bool) or not isinstance(stars, int) or stars < 1:
+        raise PriceUnavailable("invalid amount")
+    db = get_db()
+    cost_doc = await get_rate_doc("XTR")                     # Toman cost of ONE Star = stars_cost_usd x USD rate
+    usd = await db.exchange_rates.find_one({"_id": "USD"})
+    limit = timedelta(minutes=await st.get_int("manual_rate_max_age_minutes" if usd.get("source") == "manual" else "max_age_minutes"))
+    fetched = as_aware(usd.get("fetched_at"))
+    if fetched is None or utcnow() - fetched > limit:
+        raise PriceUnavailable("USD rate is stale")
+    stars_usd = await st.get_setting("stars_usd_value")
+    if not stars_usd:
+        raise PriceUnavailable("stars_usd_value is not set")
+    breakdown = compute_price(stars, "XTR", to_decimal(cost_doc["toman_per_unit"]), await st.get_setting("profit_toman"),
+                              await st.get_int("rounding_step"), await st.get_setting("rounding_mode"))
+    toman_per_star = to_decimal(stars_usd) * to_decimal(usd["toman_per_unit"])
+    stars_amount = stars_within_profit_cap(breakdown.final_toman, toman_per_star, breakdown.cost_toman)
+    return {
+        "custom": True, "base_amount": str(breakdown.base_amount), "base_currency": "XTR",
+        "rate_toman_per_unit": str(breakdown.rate_toman_per_unit), "cost_toman": str(breakdown.cost_toman),
+        "profit_toman": str(breakdown.profit_toman), "effective_profit_toman": str(breakdown.effective_profit_toman),
+        "final_toman": breakdown.final_toman, "toman_per_star": str(toman_per_star), "stars_amount": stars_amount,
+        "stars_profit_toman": str((Decimal(stars_amount) * toman_per_star - breakdown.cost_toman).quantize(Decimal("1"))),
+        "usd_rate_fetched_at": fetched, "usd_rate_source": usd.get("source"), "updated_at": utcnow(),
+    }
+
+
 async def refresh_all(rate_provider: RateProvider | None = None, fetch: bool = True) -> dict:
     """One cycle. fetch=True also asks the rate API; fetch=False only recomputes from cached inputs
     (after a settings change, a manual rate, a Telegram sync...). Telegram data is synced separately
     (telegram_supply.sync_supply) BEFORE this runs."""
     db = get_db()
-    products = [p async for p in db.products.find({})]
+    products = [p async for p in db.products.find({}) if not p.get("custom_amount")]   # custom-amount product is priced per order
     report: dict = {"rates": {}, "products": {}}
     if fetch:
         currencies = {"USD"}   # Stars price for the customer always needs the USD rate

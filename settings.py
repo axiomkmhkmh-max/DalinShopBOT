@@ -1,6 +1,7 @@
 """Runtime settings stored in MongoDB (editable from the admin dashboard)."""
 from __future__ import annotations
 
+import config as _config
 from db import get_db
 from money import MoneyError, ROUNDING_MODES, to_decimal, validate_profit
 from util import utcnow
@@ -23,10 +24,35 @@ DEFAULTS: dict[str, str | None] = {
     "payment_stars_enabled": "true",
     "wallet_payment_enabled": "false",
     "referral_reward_toman": "0",
+    # wallet top-up through Zarinpal (OFF by default: see README, Telegram's rules for digital goods)
+    "zarinpal_topup_enabled": "false",
+    "topup_min_toman": "10000",
+    "topup_max_toman": "5000000",
+    "topup_presets": "50000,100000,200000,500000",
+    # custom Stars amount (typed by the customer)
+    "custom_stars_enabled": "false",
+    "custom_stars_min": "50",
+    "custom_stars_max": "10000",
+    # wallet-paid order whose delivery DEFINITELY failed before anything was sent: refund to the wallet automatically
+    "wallet_auto_refund_on_fail": "false",
 }
 
 
+# An Environment Variable (when set) wins over the dashboard value, so a beginner can switch features without touching code.
+ENV_OVERRIDES = {"zarinpal_topup_enabled": "zarinpal_enabled", "wallet_payment_enabled": "wallet_payments_enabled",
+                 "custom_stars_enabled": "custom_stars_enabled"}
+
+
+def env_override(key: str) -> str | None:
+    attr = ENV_OVERRIDES.get(key)
+    val = getattr(_config.get_config(), attr, None) if attr else None
+    return None if val is None else ("true" if val else "false")
+
+
 async def get_setting(key: str) -> str | None:
+    forced = env_override(key)
+    if forced is not None:
+        return forced
     doc = await get_db().settings.find_one({"key": key})
     if doc is not None:
         return doc["value"]
@@ -41,7 +67,8 @@ def _validate(key: str, value: str) -> str:
         if value not in ROUNDING_MODES:
             raise MoneyError("invalid rounding mode")
     elif key in ("rounding_step", "refresh_interval_minutes", "max_age_minutes", "manual_rate_max_age_minutes",
-                 "order_ttl_minutes", "stars_auto_min"):
+                 "order_ttl_minutes", "stars_auto_min", "topup_min_toman", "topup_max_toman", "custom_stars_min",
+                 "custom_stars_max"):
         if not value.isdigit() or int(value) < 1:
             raise MoneyError(f"{key} must be a positive integer")
         if key == "refresh_interval_minutes" and int(value) < 5:
@@ -52,7 +79,13 @@ def _validate(key: str, value: str) -> str:
     elif key == "referral_reward_toman":
         if not value.isdigit():
             raise MoneyError("reward must be a whole number")
-    elif key in ("payment_stars_enabled", "wallet_payment_enabled", "auto_refresh_enabled", "auto_delivery_enabled"):
+    elif key == "topup_presets":
+        parts = [p.strip() for p in value.replace("،", ",").replace("٬", ",").split(",") if p.strip()]
+        if not parts or len(parts) > 8 or not all(p.isascii() and p.isdigit() and 0 < int(p) <= 10**9 for p in parts):
+            raise MoneyError("presets must be up to 8 whole numbers separated by commas")
+        value = ",".join(str(int(p)) for p in parts)
+    elif key in ("payment_stars_enabled", "wallet_payment_enabled", "auto_refresh_enabled", "auto_delivery_enabled",
+                 "zarinpal_topup_enabled", "custom_stars_enabled", "wallet_auto_refund_on_fail"):
         value = "true" if value.lower() in ("1", "true", "yes", "on") else "false"
     elif key not in DEFAULTS:
         raise MoneyError("unknown setting")

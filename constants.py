@@ -63,3 +63,16 @@ PERMISSIONS: dict[str, set[str]] = {
 def has_permission(role: str, perm: str) -> bool:
     perms = PERMISSIONS.get(role, set())
     return "*" in perms or perm in perms
+
+
+# Technical names used in the requirements (created / awaiting_payment / paid / processing / delivered /
+# pending_manual_delivery / failed / refunded). The stored statuses stay as they are (existing data + tests); this is
+# the mapping shown in the dashboard and used in reports. "created" is the first entry of an order's history.
+def canonical_status(order: dict) -> str:
+    st = order.get("status")
+    if st == S.PROCESSING and order.get("fulfillment_status") == "MANUAL_PENDING":
+        return "pending_manual_delivery"
+    return {
+        S.PENDING_PAYMENT: "awaiting_payment", S.PAID: "paid", S.PROCESSING: "processing", S.FULFILLED: "delivered",
+        S.FAILED: "failed", S.CANCELLED: "cancelled", S.REFUND_PENDING: "refund_pending", S.REFUNDED: "refunded",
+    }.get(st, str(st))

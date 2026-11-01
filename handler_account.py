@@ -7,7 +7,7 @@ from aiogram.types import CallbackQuery, Message
 import keyboards as K
 import texts as T
 from constants import STATUS_FA, OrderStatus as S
-import orders, wallet
+import orders, topups, wallet
 from util import fa_digits, fmt_toman
 
 router = Router()
@@ -56,7 +56,12 @@ async def order_detail(c: CallbackQuery):
 @router.message(Command("wallet"))
 async def wallet_view(m: Message):
     bal = await wallet.get_balance(m.from_user.id)
-    await m.answer(f"موجودی کیف پول: {fmt_toman(bal)}")
+    kb = None
+    if await topups.is_enabled():
+        from aiogram.types import InlineKeyboardButton as IB, InlineKeyboardMarkup
+        kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="➕ شارژ کیف پول", callback_data="wt:menu")],
+                                                   [IB(text="🔄 بررسی شارژهای در انتظار", callback_data="wt:chk")]])
+    await m.answer(f"موجودی کیف پول: {fmt_toman(bal)}", reply_markup=kb)
 
 
 @router.message(F.text == T.MENU_INVITE)

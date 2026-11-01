@@ -10,12 +10,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from config import get_config
-from constants import STATUS_FA, OrderStatus as S, has_permission
+from constants import STATUS_FA, OrderStatus as S, canonical_status, has_permission
 from db import get_db
 from money import MoneyError, to_decimal, validate_profit
 from payment_manager import get_provider
 import background_hooks as hooks
-import catalog, fulfillment, orders, stars_delivery, telegram_supply, wallet
+import catalog, fulfillment, orders, stars_delivery, telegram_supply, topups, wallet
 import pricing_engine as engine
 import settings as st
 from audit import audit
@@ -32,7 +32,8 @@ templates.env.globals["has_permission"] = has_permission
 NAV = [  # (label, path, permission)
     ("نمای کلی", "/", None), ("محصولات", "/products", "products"), ("دسته‌بندی‌ها", "/categories", "products"),
     ("قیمت‌گذاری", "/pricing", "pricing_view"), ("سفارش‌ها", "/orders", "orders_view"),
-    ("پرداخت‌ها", "/payments", "payments"), ("کیف پول‌ها", "/wallets", "wallets_adjust"),
+    ("پرداخت‌ها", "/payments", "payments"), ("شارژ و تنظیمات کیف پول", "/topups", "payments"),
+    ("کیف پول‌ها", "/wallets", "wallets_adjust"),
     ("کاربران", "/users", "users"), ("تأمین و تحویل", "/suppliers", "suppliers"),
     ("پشتیبانی", "/tickets", "support"), ("خطاها", "/errors", "orders_view"), ("لاگ ممیزی", "/audit", "audit"),
 ]
@@ -288,7 +289,7 @@ async def products_page(request: Request, admin=Depends(auth.current_admin)):
     db = get_db()
     cats = [(c["public_id"], c["name"]) async for c in db.categories.find({})]
     groups: dict[str, list] = {k: [] for k in KIND_TITLES}
-    async for p in db.products.find({}).sort("created_at", -1):
+    async for p in db.products.find({"hidden": {"$ne": True}}).sort("created_at", -1):
         q = await db.price_quotes.find_one({"product_id": p["public_id"]})
         groups.setdefault(p.get("kind") if p.get("kind") in KIND_TITLES else "other", []).append(_product_row(p, q))
     cols = ["نام", "مقدار", "تحویل", "قیمت خرید (تومان)", "قیمت فروش (تومان)", "Stars مشتری", "موجودی", "وضعیت",
@@ -545,10 +546,12 @@ async def orders_page(request: Request, status: str = "", q: str = "", pay: str 
             if o["status"] == S.PROCESSING:
                 btns.append({"form": {"action": f"/orders/{o['public_id']}/deliver", "label": "تحویل شد", "confirm": "تحویل ثبت شود؟ (مطمئن شوید محصول را تحویل داده‌اید)", "text_field": "delivery_text"}})
         if can(admin, "refunds") and o["status"] in (S.PAID, S.PROCESSING, S.FAILED, S.FULFILLED):
-            btns.append({"form": {"action": f"/orders/{o['public_id']}/refund", "label": "لغو و بازپرداخت Stars", "confirm": "بازپرداخت انجام و غیرقابل بازگشت است. ادامه؟", "danger": True}})
+            btns.append({"form": {"action": f"/orders/{o['public_id']}/refund", "text_field": "reason",
+                                  "label": "بازپرداخت به کیف پول (دلیل را بنویسید)" if o.get("payment_method") == "wallet" else "لغو و بازپرداخت Stars (دلیل را بنویسید)",
+                                  "confirm": "بازپرداخت انجام و غیرقابل بازگشت است. ادامه؟", "danger": True}})
         spec = o.get("delivery_spec") or {}
         uname = names.get(o["user_id"])
-        rows.append([o["public_id"][:8], (f"@{uname} " if uname else "") + str(o["user_id"]),
+        rows.append([o["public_id"][:8], (f"@{uname} " if uname else "") + str(o["user_id"]) + (f" ← @{o['target_username']}" if o.get("target_username") else ""),
                      f"{o['product_name']} × {o['quantity']}", DELIVERY_FA.get(spec.get("delivery") or "manual", "دستی"),
                      f"{o.get('amount', o.get('stars_amount')) or '—'} {o.get('currency', 'XTR')}",
                      METHOD_FA.get(o.get("payment_method"), o.get("payment_method")),
@@ -586,6 +589,10 @@ async def order_detail_page(oid: str, request: Request, admin=Depends(auth.curre
             ["وضعیت پرداخت", PAY_STATUS_FA.get(o.get("payment_status"), o.get("payment_status"))],
             ["وضعیت تحویل", DELIVERY_STATUS_FA.get(o.get("fulfillment_status"), o.get("fulfillment_status"))],
             ["وضعیت سفارش", STATUS_FA.get(o["status"], o["status"])],
+            ["نام فنی وضعیت", canonical_status(o)],
+            ["حساب مقصد (Stars)", f"@{o['target_username']}" if o.get("target_username") else "—"],
+            ["شناسه پیگیری تحویل", o.get("delivery_ref") or "—"],
+            ["دلیل بازپرداخت", o.get("refund_reason") or "—"],
             ["زمان ایجاد", ts(o.get("created_at"))], ["زمان پرداخت", ts(o.get("paid_at"))],
             ["زمان تحویل", ts(o.get("completed_at"))],
             ["شناسه پیگیری پرداخت", o.get("paid_charge_id") or "—"],
@@ -627,22 +634,34 @@ async def order_retry(oid: str, request: Request, admin=Depends(auth.current_adm
 async def order_deliver(oid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form(""), delivery_text: str = Form("")):
     auth.check_csrf(request, csrf)
     need_any(admin, "orders")
+    existing = await orders.get_order(oid)
+    if existing and existing.get("target_username") and not delivery_text.strip():
+        return back(request, "/orders", "برای سفارش Stars ثبت «شناسه پیگیری تحویل» الزامی است.")
     ok = await fulfillment.complete_manual(oid, admin["username"], delivery_text.strip())
     await audit(admin["username"], "order_deliver", oid, {"ok": ok})
     return back(request, "/orders", "تحویل ثبت شد." if ok else "ثبت تحویل ممکن نبود.")
 
 
 @router.post("/orders/{oid}/refund")
-async def order_refund(oid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+async def order_refund(oid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form(""), reason: str = Form("")):
     auth.check_csrf(request, csrf)
     need_any(admin, "refunds")
+    reason = reason.strip()
+    if not reason:
+        return back(request, "/orders", "دلیل بازپرداخت الزامی است.")
     order = await orders.get_order(oid)
     ok = False
     if order:
-        ok = await get_provider("stars").refund(order, bot=get_bot(), actor=admin["username"])
-    await audit(admin["username"], "order_refund", oid, {"ok": ok})
+        if order.get("payment_method") == "wallet":
+            ok = await get_provider("wallet").refund(order, actor=admin["username"], reason=reason)
+        else:
+            ok = await get_provider("stars").refund(order, bot=get_bot(), actor=admin["username"])
+            if ok:
+                await get_db().orders.update_one({"public_id": oid}, {"$set": {"refund_reason": reason[:200], "refunded_by": admin["username"]}})
+    await audit(admin["username"], "order_refund", oid, {"ok": ok, "reason": reason[:200]})
     if ok:
-        await send_user(order["user_id"], f"مبلغ سفارش {oid[:8]} به‌صورت Stars به شما بازگردانده شد.")
+        where = "به کیف پول شما" if order.get("payment_method") == "wallet" else "به‌صورت Stars به شما"
+        await send_user(order["user_id"], f"مبلغ سفارش {oid[:8]} {where} بازگردانده شد.")
     return back(request, "/orders", "بازپرداخت انجام شد." if ok else "بازپرداخت انجام نشد.")
 
 
@@ -657,17 +676,23 @@ async def payments_page(request: Request, admin=Depends(auth.current_admin)):
 
 
 @router.get("/wallets", response_class=HTMLResponse)
-async def wallets_page(request: Request, admin=Depends(auth.current_admin)):
+async def wallets_page(request: Request, user: str = "", admin=Depends(auth.current_admin)):
     need_any(admin, "wallets_adjust")
     db = get_db()
-    rows = [[w["user_id"], f"{w['balance']:,}"] async for w in db.wallets.find({}).sort("balance", -1).limit(100)]
+    flt = {"user_id": int(user)} if user.strip().isdigit() else {}
+    rows = [[w["user_id"], f"{w['balance']:,}"] async for w in db.wallets.find(flt).sort("balance", -1).limit(100)]
     ledger = [[str(l["created_at"])[:16], l["user_id"], l["type"], l["amount"], l["balance_after"], l.get("actor", ""), l.get("note", "")]
-              async for l in db.wallet_ledger.find({}).sort("created_at", -1).limit(50)]
+              async for l in db.wallet_ledger.find(flt).sort("created_at", -1).limit(200 if flt else 50)]
+    if flt:
+        rec = await wallet.reconcile(flt["user_id"])
+        rows.append(["تطبیق با دفتر کل", "سالم ✔" if rec["ok"] else f"ناهمخوان ✖ (دفتر کل {rec['ledger_sum']:,} / موجودی {rec['balance']:,})"])
+    lookup = {"action": "/wallets", "method": "get", "title": "جستجوی کاربر (موجودی + تاریخچه شارژ/برداشت)", "submit": "نمایش",
+              "fields": [form_field("user", "شناسه عددی تلگرام", user)]}
     form = {"action": "/wallets/adjust", "title": "تنظیم موجودی (ثبت در دفتر کل)", "submit": "اعمال", "fields": [
         form_field("user_id", "شناسه عددی تلگرام", required=True),
         form_field("amount", "مبلغ تومان (مثبت = شارژ، منفی = کسر)", required=True),
         form_field("note", "توضیح", required=True)]}
-    return render(request, admin, "page.html", title="کیف پول‌ها", forms=[form], tables=[
+    return render(request, admin, "page.html", title="کیف پول‌ها", forms=[lookup, form], tables=[
         {"title": "موجودی‌ها", "columns": ["کاربر", "موجودی (تومان)"], "rows": rows},
         {"title": "دفتر کل (آخرین ۵۰)", "columns": ["زمان", "کاربر", "نوع", "مبلغ", "مانده", "توسط", "توضیح"], "rows": ledger}])
 
@@ -689,6 +714,90 @@ async def wallets_adjust(request: Request, admin=Depends(auth.current_admin), cs
         return back(request, "/wallets", "موجودی کافی نیست.")
     await audit(admin["username"], "wallet_adjust", str(user_id), {"amount": amount, "note": note})
     return back(request, "/wallets", "ثبت شد.")
+
+
+# ---------------- wallet top-up (Zarinpal) + wallet settings ----------------
+TOPUP_SETTING_KEYS = ("zarinpal_topup_enabled", "topup_min_toman", "topup_max_toman", "topup_presets", "wallet_payment_enabled",
+                      "wallet_auto_refund_on_fail", "custom_stars_enabled", "custom_stars_min", "custom_stars_max")
+
+
+@router.get("/topups", response_class=HTMLResponse)
+async def topups_page(request: Request, admin=Depends(auth.current_admin)):
+    need_any(admin, "payments")
+    db = get_db()
+    cfg = get_config()
+    s = await st.all_settings()
+    ts = lambda v: str(v)[:16] if v else "—"
+    rows = []
+    async for t in db.topups.find({}).sort("created_at", -1).limit(100):
+        btns = []
+        if t["status"] != topups.PAID and t.get("authority"):
+            btns.append({"form": {"action": f"/topups/{t['public_id']}/recheck", "label": "بررسی مجدد با زرین‌پال",
+                                  "confirm": "وضعیت این پرداخت از زرین‌پال پرسیده شود؟ (فقط در صورت پرداخت واقعی شارژ می‌شود)"}})
+        rows.append([t["public_id"][:8], t["user_id"], f"{t['amount_toman']:,}", topups.STATUS_FA.get(t["status"], t["status"]),
+                     t.get("ref_id") or "—", t.get("last_verify_code", "—"), t.get("error") or "", ts(t.get("created_at")), btns])
+    on = lambda v: "روشن" if v == "true" else "خاموش"
+    status_rows = [
+        ["شارژ با زرین‌پال", "فعال" if await topups.is_enabled() else "غیرفعال (کلید، مرچنت‌کد و آدرس عمومی لازم است)"],
+        ["مرچنت‌کد در متغیر محیطی", "تنظیم شده" if cfg.zarinpal_merchant_id else "تنظیم نشده"],
+        ["آدرس عمومی (PUBLIC_BASE_URL)", "تنظیم شده" if cfg.base_url else "تنظیم نشده"],
+        ["حالت آزمایشی (sandbox)", "بله" if cfg.zarinpal_sandbox else "خیر"],
+        ["TESTING_MODE (فقط تست‌کننده)", ("روشن — تست‌کننده‌ها: " + (cfg.tester_user_ids or "⚠ خالی: پرداخت برای همه بسته است")) if cfg.testing_mode else "خاموش"],
+        ["تحویل Stars", "دستی" + (" (خودکار هم خاموش است)" if not cfg.auto_stars_delivery else " (روش خودکار رسمی وجود ندارد)")],
+        ["کلیدهای محیطی فعال‌کننده", ", ".join(k for k, v in (("ZARINPAL_ENABLED", cfg.zarinpal_enabled), ("WALLET_PAYMENTS_ENABLED", cfg.wallet_payments_enabled), ("CUSTOM_STARS_ENABLED", cfg.custom_stars_enabled)) if v is not None) or "هیچ‌کدام (تنظیمات پنل)"],
+        ["پرداخت سفارش از کیف پول", on(s["wallet_payment_enabled"])],
+        ["مجموع موجودی کیف پول‌ها", f"{sum([w['balance'] async for w in db.wallets.find({})]):,}"],
+    ]
+    sel = [("true", "روشن"), ("false", "خاموش")]
+    fields = [form_field("zarinpal_topup_enabled", "شارژ کیف پول با زرین‌پال", s["zarinpal_topup_enabled"], "select", sel),
+              form_field("topup_min_toman", "حداقل مبلغ شارژ (تومان)", s["topup_min_toman"]),
+              form_field("topup_max_toman", "حداکثر مبلغ شارژ (تومان)", s["topup_max_toman"]),
+              form_field("topup_presets", "مبلغ‌های پیشنهادی (تومان، با کاما)", s["topup_presets"]),
+              form_field("wallet_payment_enabled", "پرداخت سفارش از کیف پول", s["wallet_payment_enabled"], "select", sel),
+              form_field("wallet_auto_refund_on_fail", "بازپرداخت خودکار به کیف پول وقتی تحویل قطعاً ناموفق شد (فقط سفارش‌های کیف پول)", s["wallet_auto_refund_on_fail"], "select", sel),
+              form_field("custom_stars_enabled", "خرید Stars با تعداد دلخواه", s["custom_stars_enabled"], "select", sel),
+              form_field("custom_stars_min", "حداقل تعداد Stars دلخواه", s["custom_stars_min"]),
+              form_field("custom_stars_max", "حداکثر تعداد Stars دلخواه", s["custom_stars_max"])]
+    form = {"action": "/topups/settings", "title": "تنظیمات کیف پول، شارژ و تعداد دلخواه", "submit": "ذخیره", "fields": fields}
+    return render(request, admin, "page.html", title="شارژ و تنظیمات کیف پول", forms=[form], tables=[
+        {"title": "وضعیت", "columns": ["مورد", "وضعیت"], "rows": status_rows},
+        {"title": "تاریخچه شارژها (آخرین ۱۰۰)", "columns": ["شناسه", "کاربر", "مبلغ (تومان)", "وضعیت", "شماره پیگیری زرین‌پال", "آخرین کد بررسی", "خطا", "زمان", "عملیات"], "rows": rows}])
+
+
+@router.post("/topups/settings")
+async def topups_settings(request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "payments")
+    form = await request.form()
+    new = {k: (form.get(k) or "").strip() for k in TOPUP_SETTING_KEYS}
+    try:
+        lo = int(new["topup_min_toman"] or await st.get_setting("topup_min_toman"))
+        hi = int(new["topup_max_toman"] or await st.get_setting("topup_max_toman"))
+        clo = int(new["custom_stars_min"] or await st.get_setting("custom_stars_min"))
+        chi = int(new["custom_stars_max"] or await st.get_setting("custom_stars_max"))
+        if lo > hi or clo > chi:
+            return back(request, "/topups", "خطا: حداقل نباید از حداکثر بیشتر باشد.")
+        changed = []
+        for key, val in new.items():
+            if val and val != (await st.get_setting(key) or ""):
+                await st.set_setting(key, val)
+                changed.append(key)
+    except (MoneyError, ValueError) as exc:
+        return back(request, "/topups", f"خطا: {exc}")
+    await audit(admin["username"], "wallet_settings", ",".join(changed))
+    return back(request, "/topups", "تنظیمات ذخیره شد.")
+
+
+@router.post("/topups/{tid}/recheck")
+async def topups_recheck(tid: str, request: Request, admin=Depends(auth.current_admin), csrf: str = Form("")):
+    auth.check_csrf(request, csrf)
+    need_any(admin, "payments")
+    t = await topups.get_topup(tid)
+    if not t or not t.get("authority"):
+        return back(request, "/topups", "پرداخت پیدا نشد.")
+    res = await topups.settle(tid, t["authority"], "OK", from_callback=False)
+    await audit(admin["username"], "topup_recheck", tid, {"result": res.code})
+    return back(request, "/topups", f"نتیجه: {res.code}")
 
 
 @router.get("/users", response_class=HTMLResponse)

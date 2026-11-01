@@ -8,9 +8,12 @@ from pymongo.errors import DuplicateKeyError
 
 from constants import ALL_STATUSES, OrderStatus as S, can_transition, sources_for
 from db import get_db
+import access
 import settings as st
 from catalog import delivery_spec, get_product, purchasable
+import pricing_engine as engine
 import stars_delivery
+from stars_targets import InvalidUsername, normalize_username
 from util import as_aware, new_id, utcnow
 
 
@@ -18,22 +21,53 @@ class OrderError(Exception):
     pass
 
 
-async def create_order(user_id: int, product_id: str, quantity: int, payment_method: str = "stars") -> dict:
-    """Create (or reuse the still-open) order. The price is FROZEN here and never recomputed."""
-    if quantity < 1 or quantity > 20:
+async def _custom_quote(quantity: int) -> dict:
+    if not await st.get_bool("custom_stars_enabled"):
+        raise OrderError("خرید با تعداد دلخواه فعال نیست")
+    lo, hi = await st.get_int("custom_stars_min"), await st.get_int("custom_stars_max")
+    if not lo <= quantity <= hi:
+        raise OrderError(f"تعداد Stars باید بین {lo} و {hi} باشد")
+    try:
+        return await engine.custom_stars_quote(quantity)
+    except engine.PriceUnavailable:
+        raise OrderError("قیمت در حال به‌روزرسانی است؛ موقتاً قابل خرید نیست")
+
+
+async def create_order(user_id: int, product_id: str, quantity: int, payment_method: str = "stars", *,
+                       target_username: str | None = None) -> dict:
+    """Create (or reuse the still-open) order. The price is FROZEN here and never recomputed.
+
+    target_username: destination @username of a Stars order (format-validated, see stars_targets.py). It is part of the
+    duplicate-order key, so the same user ordering for two different accounts gets two different orders."""
+    allowed, why = access.check_payment_access(user_id)
+    if not allowed:
+        raise OrderError(why)
+    if quantity < 1:
         raise OrderError("invalid quantity")
     product = await get_product(product_id)
     if not product:
         raise OrderError("product not found")
-    ok, reason, quote = await purchasable(product)
-    if not ok:
-        raise OrderError(reason)
+    target = None
+    if target_username and product.get("kind") == "stars":
+        try:
+            target = normalize_username(target_username)
+        except InvalidUsername as exc:
+            raise OrderError(str(exc))
+    custom = bool(product.get("custom_amount"))
+    if custom:
+        quote = await _custom_quote(quantity)
+    else:
+        if quantity > 20:
+            raise OrderError("invalid quantity")
+        ok, reason, quote = await purchasable(product)
+        if not ok:
+            raise OrderError(reason)
     try:
         await stars_delivery.precheck(product, quantity)      # sender balance, BEFORE the customer pays
     except stars_delivery.InsufficientSenderBalance as exc:
         raise OrderError(str(exc))
     db = get_db()
-    open_key = f"{user_id}:{product_id}:{quantity}:{payment_method}"
+    open_key = f"{user_id}:{product_id}:{quantity}:{payment_method}" + (f":{target.lower()}" if target else "")
     now = utcnow()
 
     existing = await db.orders.find_one({"open_key": open_key})
@@ -42,10 +76,15 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
             return existing            # duplicate order prevention: reuse the open order (price stays locked)
         await transition(existing["public_id"], S.CANCELLED, note="expired")
 
-    unit = int(quote["final_toman"])
-    total_toman = unit * quantity
-    # Stars are computed PER UNIT (kept inside the 7000 Toman profit cap) and multiplied, so the cap holds per item.
-    stars_total = int(quote["stars_amount"]) * quantity if quote.get("stars_amount") else None
+    if custom:
+        total_toman = int(quote["final_toman"])
+        unit = -(-total_toman // quantity)                       # informational; the total is what is charged
+        stars_total = int(quote["stars_amount"])                 # already the TOTAL for the typed amount
+    else:
+        unit = int(quote["final_toman"])
+        total_toman = unit * quantity
+        # Stars are computed PER UNIT (kept inside the 7000 Toman profit cap) and multiplied, so the cap holds per item.
+        stars_total = int(quote["stars_amount"]) * quantity if quote.get("stars_amount") else None
 
     # Reserve stock (only products with a stock number; empty = unlimited). Released again if the order is
     # cancelled / expires / is refunded before delivery (see transition()).
@@ -64,6 +103,7 @@ async def create_order(user_id: int, product_id: str, quantity: int, payment_met
         "product_id": product_id,
         "product_name": product["name"],
         "quantity": quantity,
+        "target_username": target,                 # Stars destination account (None for other products)
         "unit_price_toman": unit,
         "total_toman": total_toman,
         "stars_amount": stars_total,

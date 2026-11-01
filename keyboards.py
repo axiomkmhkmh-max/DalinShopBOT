@@ -27,10 +27,12 @@ def categories_kb(categories: list[dict]) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def products_kb(products: list[dict], back: str | None = None) -> InlineKeyboardMarkup:
+def products_kb(products: list[dict], back: str | None = None, extra: list[tuple[str, str]] | None = None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for p in products:
         b.button(text=p["name"], callback_data=f"prod:{p['public_id']}")
+    for label, data in extra or []:
+        b.button(text=label, callback_data=data)
     b.adjust(1)
     if back:
         b.row(IB(text=T.BACK, callback_data=back))

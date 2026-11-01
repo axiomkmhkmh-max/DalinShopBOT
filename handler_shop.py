@@ -2,16 +2,22 @@ import html
 
 from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 import keyboards as K
 import texts as T
 from payment_manager import available_methods
-import catalog
+import catalog, orders, pricing_engine as engine, settings as st
 from catalog import AUTO_DELIVERIES
-from util import fa_digits, fmt_toman
+from util import fa_digits, fmt_toman, parse_int
 
 router = Router()
+
+
+class CustomStars(StatesGroup):
+    amount = State()
 
 
 async def _show_categories(m: Message):
@@ -31,10 +37,11 @@ async def shop(m: Message):
 
 async def _kind_list(m: Message, kind: str):
     prods = await catalog.list_products(kind=kind)
-    if not prods:
+    extra = [("✏️ تعداد دلخواه", "stc:menu")] if kind == "stars" and await st.get_bool("custom_stars_enabled") else []
+    if not prods and not extra:
         await m.answer(T.NO_PRODUCTS)
         return
-    await m.answer("محصول را انتخاب کنید:", reply_markup=K.products_kb(prods))
+    await m.answer("محصول را انتخاب کنید:", reply_markup=K.products_kb(prods, extra=extra))
 
 
 @router.message(F.text == T.MENU_PREMIUM)
@@ -115,3 +122,45 @@ async def qty(c: CallbackQuery):
         f"<b>{html.escape(p['name'])}</b>\nتعداد: {fa_digits(qty_i)}\nمبلغ: {fa_digits(stars_total)} Stars\n\nروش پرداخت را انتخاب کنید:",
         reply_markup=K.payment_methods_kb(pid, qty_i, methods), parse_mode="HTML")
     await c.answer()
+
+
+# ---- Stars: the customer types any number of Stars (price computed per order by pricing_engine.custom_stars_quote)
+@router.callback_query(F.data == "stc:menu")
+async def custom_menu(c: CallbackQuery, state: FSMContext):
+    if not await st.get_bool("custom_stars_enabled"):
+        await c.answer("خرید با تعداد دلخواه فعال نیست.", show_alert=True)
+        return
+    lo, hi = await st.get_int("custom_stars_min"), await st.get_int("custom_stars_max")
+    await state.set_state(CustomStars.amount)
+    await c.message.answer(f"تعداد Stars دلخواه را بفرستید (بین {fa_digits(lo)} و {fa_digits(hi)}).\nبرای انصراف: /cancel")
+    await c.answer()
+
+
+@router.message(CustomStars.amount, F.text)
+async def custom_amount(m: Message, state: FSMContext):
+    if m.text.startswith("/cancel") or m.text in T.ALL_MENU_BUTTONS:
+        await state.clear()
+        await m.answer("لغو شد.")
+        return
+    n = parse_int(m.text)
+    if n is None:
+        await m.answer("فقط یک عدد بفرستید، یا /cancel.")
+        return
+    lo, hi = await st.get_int("custom_stars_min"), await st.get_int("custom_stars_max")
+    if not lo <= n <= hi:
+        await m.answer(f"تعداد باید بین {fa_digits(lo)} و {fa_digits(hi)} باشد.")
+        return
+    try:
+        quote = await engine.custom_stars_quote(n)
+    except engine.PriceUnavailable:
+        await state.clear()
+        await m.answer(T.PRICE_PAUSED)
+        return
+    product = await catalog.ensure_custom_stars_product()
+    methods = [x.key for x in await available_methods(product)]
+    await state.clear()
+    if not methods:
+        await m.answer("روش پرداخت فعالی وجود ندارد.")
+        return
+    await m.answer(f"{fa_digits(n)} Stars\nقیمت: {fmt_toman(quote['final_toman'])}\nمعادل پرداخت با Stars: {fa_digits(quote['stars_amount'])}\n\nروش پرداخت را انتخاب کنید:",
+                   reply_markup=K.payment_methods_kb(product["public_id"], n, methods))

@@ -13,7 +13,7 @@ import logging
 from constants import OrderStatus as S
 from db import get_db
 from payment_base import PaymentInit, PaymentProvider, PaymentResult
-import notifier, orders
+import access, notifier, orders
 import settings as st
 from util import as_aware, utcnow
 
@@ -45,6 +45,9 @@ class StarsProvider(PaymentProvider):
         })
 
     async def pre_checkout(self, user_id: int, payload: str, currency: str, total: int) -> tuple[bool, str]:
+        allowed, why = access.check_payment_access(user_id)
+        if not allowed:
+            return False, why
         order = await orders.get_order(payload)
         if not order:
             return False, "سفارش پیدا نشد."

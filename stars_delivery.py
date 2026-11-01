@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 
 from db import get_db
 import settings as st
+from config import get_config
 from supplier_base import Supplier, SupplierRequest, SupplierResult
 from util import redact, utcnow
 
@@ -48,7 +49,8 @@ class StarsSender(ABC):
         """Stars balance of the account that would really send (NOT the bot's balance)."""
 
     @abstractmethod
-    async def send_stars(self, user_id: int, stars: int, idempotency_key: str) -> None: ...
+    async def send_stars(self, user_id: int, stars: int, idempotency_key: str, *, target_username: str | None = None) -> None:
+        """`user_id` is the BUYER; `target_username` (without @) is the destination account the customer typed."""
 
 
 _sender: StarsSender | None = None
@@ -70,6 +72,8 @@ def stars_total(product: dict, quantity: int) -> int:
 async def auto_plan(product: dict, quantity: int) -> tuple[bool, str]:
     """(automatic delivery possible?, reason in Persian when not)."""
     total = stars_total(product, quantity)
+    if not get_config().auto_stars_delivery:
+        return False, "تحویل خودکار Stars خاموش است (AUTO_STARS_DELIVERY=false)؛ تحویل دستی"
     minimum = await st.get_int("stars_auto_min")
     if total < minimum:
         return False, f"کمتر از {minimum} Stars؛ تحویل دستی"
@@ -88,6 +92,8 @@ async def precheck(product: dict, quantity: int) -> None:
         return
     auto, _ = await auto_plan(product, quantity)
     if not auto:
+        if not get_config().manual_stars_delivery:
+            raise InsufficientSenderBalance("تحویل Stars فعلاً غیرفعال است (MANUAL_STARS_DELIVERY=false)")
         return                                   # manual delivery: nothing to check here
     try:
         bal = await get_sender().balance()
@@ -129,7 +135,8 @@ class StarsSupplier(Supplier):
              "$setOnInsert": {"created_at": utcnow(), "supplier_key": "stars", "status": "SENDING"}},
             upsert=True)
         try:
-            await sender.send_stars(req.user_id, total, f"order:{req.order_id}")
+            extra = {"target_username": req.target_username} if req.target_username else {}
+            await sender.send_stars(req.user_id, total, f"order:{req.order_id}", **extra)
         except StarsSendRefused as exc:
             await db.supplier_orders.update_one({"order_id": req.order_id}, {"$set": {"send_state": "IDLE"}})
             return SupplierResult("FAILED", redact(f"ارسال رد شد: {exc}"))
